@@ -186,7 +186,7 @@ ports' output for the same real area disagree on a majority of pixels.
 
 ## Scope / known gaps
 
-This repo is a working slice of a larger pipeline, not the whole thing. It can serve as a useful data input tool in terrain analyses.
+This repo is a working slice of a larger pipeline. It can serve as a useful data input tool in terrain analyses.
 
 ## Data sources
 
