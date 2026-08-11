@@ -495,13 +495,60 @@ find_label_bboxes <- function(label_array) {
 #'   batch[[i]] (1-based label = batch position).
 #' @param transform GDAL-style affine list (see mask_centroid_latlon);
 #'   NULL means midpoint lat/lon are left NA.
-#' @return list(corrected=, elevation_changes=, corrected_count=, skipped_small=)
+#' @param max_water_std_m,max_correction_m Sanity-check thresholds (see
+#'   below) -- added after a real incident: an 8-pixel unnamed "water
+#'   body" got a -21.1m correction because it wasn't actually a lake --
+#'   it was a misclassified sliver sitting on a uniformly steep
+#'   hillside, confirmed by direct pixel inspection of a real tile. Its
+#'   own raw elevations spanned 12.2m and its shoreline ring spanned
+#'   37.4m -- neither remotely plausible for real still water or a
+#'   real shoreline. Across a full tile's 1,176 corrected bodies, max
+#'   |correction| shrank monotonically with body size while the median
+#'   stayed flat, confirming the failure concentrates in small/
+#'   misclassified bodies where the fixed, non-slope-adaptive
+#'   buffer_pixels ring samples real terrain instead of a shoreline.
+#'   Rejects a body if max_correction_m (the candidate correction,
+#'   surface_elev - orig_mean) is exceeded. max_water_std_m is NOT a
+#'   hard gate -- it only marks an applied correction low_confidence.
+#'
+#'   Two alternative designs were tried and reverted after live-
+#'   testing against a real tile, in favor of gating on the correction
+#'   itself:
+#'     - Gating on shore_std (the shoreline ring's own sd): a real
+#'       alpine lake's ring routinely has 5-9m of legitimate relief
+#'       (the percentile pick is specifically designed to tolerate
+#'       that by favoring the ring's low end); an absolute sd
+#'       threshold there flagged 90 real named lakes, 0 confirmed true
+#'       positives among them.
+#'     - Gating on water_std (the water body's own raw noise) as a
+#'       hard block: worse than shore_std -- it can't distinguish
+#'       "genuinely not flat" from "genuinely flat water with noisy
+#'       raw DEM data" (water surfaces routinely produce noisy
+#'       lidar/photogrammetric returns). Live-tested: 8 real bodies
+#'       (including a named lake) that would have gotten a perfectly
+#'       sane 1-10m correction were instead silently left with their
+#'       noisy raw elevation un-fixed -- the exact failure this exists
+#'       to prevent, just moved one level down.
+#'   water_std is still computed and carried through as a non-blocking
+#'   low_confidence marker on applied corrections -- informative for
+#'   review, not a reason to withhold a correction the shoreline ring
+#'   (an independent sample) says is fine.
+#'
+#'   A rejected body leaves the original DEM values in place (safer
+#'   than an arbitrary flattening) and is recorded in flagged_bodies
+#'   instead of elevation_changes, so it stays visible rather than
+#'   silently vanishing.
+#' @return list(corrected=, elevation_changes=, corrected_count=,
+#'   skipped_small=, skipped_implausible=, flagged_bodies=)
 process_label_array <- function(label_array, corrected, batch,
                                  buffer_pixels, shore_percentile, min_water_pixels,
-                                 transform = NULL) {
+                                 transform = NULL,
+                                 max_water_std_m = 2.5, max_correction_m = 10.0) {
   elevation_changes <- list()
+  flagged_bodies <- list()
   corrected_count <- 0L
   skipped_small <- 0L
+  skipped_implausible <- 0L
 
   h <- nrow(label_array); w <- ncol(label_array)
   water_any <- label_array > 0
@@ -548,21 +595,50 @@ process_label_array <- function(label_array, corrected, batch,
       if (length(valid) == 0) next
     }
 
-    surface_elev <- as.numeric(quantile(valid, probs = shore_percentile / 100,
-                                         names = FALSE, type = 7))
-
+    # Original values for stats, read BEFORE any write so this is
+    # always the true pre-correction elevation.
     orig_vals <- corrected[r_range, c_range, drop = FALSE][water_mask_local]
     valid_orig <- orig_vals[orig_vals > -1000]
     orig_mean <- if (length(valid_orig) > 0) mean(valid_orig) else 0.0
+    water_std <- if (length(valid_orig) > 1) sd(valid_orig) else 0.0
+    shore_std <- sd(valid)
+    if (length(valid) < 2) shore_std <- 0.0  # sd() of a single value is NA
+
+    poly <- batch[[batch_pos]]$poly
+    name <- if (is.null(poly$properties$name)) "" else poly$properties$name
+    mid <- mask_centroid_latlon(water_mask_local, bbox$r_min - 1, bbox$c_min - 1, transform)
+    lat_out <- if (is.na(mid$lat)) NULL else round(mid$lat, 5)
+    lon_out <- if (is.na(mid$lon)) NULL else round(mid$lon, 5)
+
+    surface_elev <- as.numeric(quantile(valid, probs = shore_percentile / 100,
+                                         names = FALSE, type = 7))
+
+    # Sanity check: see this function's @param docs above for the real
+    # incident that motivated this, and for why it gates on the
+    # candidate correction itself rather than on water_std or
+    # shore_std directly (both tried as hard gates first and reverted
+    # after live-testing against a real tile -- water_std in
+    # particular has a worse failure mode than shore_std did: it can't
+    # tell "genuinely not flat" apart from "genuinely flat water with
+    # noisy raw DEM data", and gating on it hard silently left real
+    # bodies with sane available corrections un-fixed).
+    if (abs(surface_elev - orig_mean) > max_correction_m) {
+      skipped_implausible <- skipped_implausible + 1L
+      flagged_bodies[[length(flagged_bodies) + 1]] <- list(
+        polygon_index = batch[[batch_pos]]$orig_idx, name = name,
+        pixel_count = pixel_count,
+        water_std_m = round(water_std, 1), shore_std_m = round(shore_std, 1),
+        candidate_surface_elev_m = round(surface_elev, 1),
+        candidate_change_m = round(surface_elev - orig_mean, 1),
+        reason = "correction_too_large", lat = lat_out, lon = lon_out
+      )
+      next
+    }
 
     corrected_block <- corrected[r_range, c_range, drop = FALSE]
     corrected_block[water_mask_local] <- surface_elev
     corrected[r_range, c_range] <- corrected_block
     corrected_count <- corrected_count + 1L
-
-    poly <- batch[[batch_pos]]$poly
-    name <- if (is.null(poly$properties$name)) "" else poly$properties$name
-    mid <- mask_centroid_latlon(water_mask_local, bbox$r_min - 1, bbox$c_min - 1, transform)
 
     elevation_changes[[length(elevation_changes) + 1]] <- list(
       polygon_index = batch[[batch_pos]]$orig_idx, name = name,
@@ -570,13 +646,15 @@ process_label_array <- function(label_array, corrected, batch,
       surface_elev_m = round(surface_elev, 1),
       original_mean_m = round(orig_mean, 1),
       change_m = round(surface_elev - orig_mean, 1),
-      lat = if (is.na(mid$lat)) NULL else round(mid$lat, 5),
-      lon = if (is.na(mid$lon)) NULL else round(mid$lon, 5)
+      water_std_m = round(water_std, 1), shore_std_m = round(shore_std, 1),
+      low_confidence = water_std > max_water_std_m,
+      lat = lat_out, lon = lon_out
     )
   }
 
   list(corrected = corrected, elevation_changes = elevation_changes,
-       corrected_count = corrected_count, skipped_small = skipped_small)
+       corrected_count = corrected_count, skipped_small = skipped_small,
+       skipped_implausible = skipped_implausible, flagged_bodies = flagged_bodies)
 }
 
 # ------------------------------------------------
@@ -589,15 +667,21 @@ process_label_array <- function(label_array, corrected, batch,
 #' once into a single label array, then processes all labels in one
 #' pass, rather than one rasterize call per polygon.
 #'
+#' @param max_water_std_m,max_correction_m Plausibility thresholds passed
+#'   through to process_label_array() -- see that function's @param
+#'   docs for the real incident that motivated them.
 #' @return stats list: total_polygons, corrected_bodies, skipped_small,
-#'   skipped_no_overlap, total_pixels_fixed, elevation_changes, n_batches.
+#'   skipped_implausible, skipped_no_overlap, total_pixels_fixed,
+#'   elevation_changes, flagged_bodies, n_batches.
 correct_dem_water_bodies <- function(input_path, output_path, water_polygons,
                                       buffer_pixels = 3, shore_percentile = 10.0,
-                                      min_water_pixels = 5, batch_size = 500,
-                                      verbose = TRUE) {
+                                      min_water_pixels = 12, batch_size = 500,
+                                      verbose = TRUE,
+                                      max_water_std_m = 2.5, max_correction_m = 10.0) {
   stats <- list(total_polygons = length(water_polygons), corrected_bodies = 0L,
-                skipped_small = 0L, skipped_no_overlap = 0L,
+                skipped_small = 0L, skipped_implausible = 0L, skipped_no_overlap = 0L,
                 total_pixels_fixed = 0L, elevation_changes = list(),
+                flagged_bodies = list(),
                 batch_size = batch_size, n_batches = 0L)
 
   r <- rast(input_path)
@@ -718,21 +802,26 @@ correct_dem_water_bodies <- function(input_path, output_path, water_polygons,
     corrected_crop <- corrected[(r_min + 1):r_max, (c_min + 1):c_max, drop = FALSE]
     step_result <- process_label_array(label_crop, corrected_crop, batch,
                                         buffer_pixels, shore_percentile, min_water_pixels,
-                                        transform = crop_transform)
+                                        transform = crop_transform,
+                                        max_water_std_m = max_water_std_m,
+                                        max_correction_m = max_correction_m)
 
     corrected[(r_min + 1):r_max, (c_min + 1):c_max] <- step_result$corrected
 
     elapsed_batch <- as.numeric(Sys.time() - t_batch, units = "secs")
     stats$corrected_bodies <- stats$corrected_bodies + step_result$corrected_count
     stats$skipped_small <- stats$skipped_small + step_result$skipped_small
+    stats$skipped_implausible <- stats$skipped_implausible + step_result$skipped_implausible
     stats$total_pixels_fixed <- stats$total_pixels_fixed +
       sum(vapply(step_result$elevation_changes, function(c) c$pixel_count, numeric(1)))
     stats$elevation_changes <- c(stats$elevation_changes, step_result$elevation_changes)
+    stats$flagged_bodies <- c(stats$flagged_bodies, step_result$flagged_bodies)
     stats$n_batches <- stats$n_batches + 1L
 
     if (verbose) {
-      cat(sprintf("%d corrected, %d too small (%.1fs)\n",
-                   step_result$corrected_count, step_result$skipped_small, elapsed_batch))
+      cat(sprintf("%d corrected, %d too small, %d implausible (%.1fs)\n",
+                   step_result$corrected_count, step_result$skipped_small,
+                   step_result$skipped_implausible, elapsed_batch))
     }
   }
 
@@ -745,11 +834,12 @@ correct_dem_water_bodies <- function(input_path, output_path, water_polygons,
               overwrite = TRUE)
 
   cat("\n[CORRECT] Summary (CPU):\n")
-  cat(sprintf("  Batches processed:    %d (batch size %d)\n", stats$n_batches, batch_size))
-  cat(sprintf("  Corrected bodies:     %d\n", stats$corrected_bodies))
-  cat(sprintf("  Skipped (too small):  %d\n", stats$skipped_small))
-  cat(sprintf("  Skipped (no overlap): %d\n", stats$skipped_no_overlap))
-  cat(sprintf("  Total pixels fixed:   %s\n", format(stats$total_pixels_fixed, big.mark = ",")))
+  cat(sprintf("  Batches processed:     %d (batch size %d)\n", stats$n_batches, batch_size))
+  cat(sprintf("  Corrected bodies:      %d\n", stats$corrected_bodies))
+  cat(sprintf("  Skipped (too small):   %d\n", stats$skipped_small))
+  cat(sprintf("  Skipped (implausible): %d\n", stats$skipped_implausible))
+  cat(sprintf("  Skipped (no overlap):  %d\n", stats$skipped_no_overlap))
+  cat(sprintf("  Total pixels fixed:    %s\n", format(stats$total_pixels_fixed, big.mark = ",")))
   cat(sprintf("  Output: %s\n", output_path))
 
   stats

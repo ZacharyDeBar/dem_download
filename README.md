@@ -136,10 +136,18 @@ NHD source, `--keep-original`):
 
 ![Example visualize_tile.py report](docs/example_report.png)
 
-The top-10 table exists to provide insight into the degree of water correction occurring: this build hit
-several water bodies with much larger corrections than expected. The
-`midpoint (lat, lon)` column made it possible to go look at each one
-directly to verify if the applied correction is appropriate. A system to undo erroneous corrections is not yet in place, but would rely on this list to identify greatest potential errors.
+The top-10 table exists to give visibility into how large water corrections
+get. An earlier build of this same tile is what surfaced a real bug: an
+8-pixel sliver of misclassified "water" on a steep hillside was getting a
+**-21.1m** correction, because its shoreline ring sampled straight down the
+slope instead of an actual shoreline. Fixed in both `dem_water_correction.py`
+and `.R` by gating on the resulting correction magnitude rather than trusting
+every water polygon's own geometry — corrections over `max_correction_m`
+(default 10m) are now skipped instead of applied, and corrections built from
+a water body whose *own* raw elevation was already noisy are applied but
+marked `low_confidence` rather than silently treated the same as a clean
+one. The `midpoint (lat, lon)` column still exists for spot-checking any
+correction directly.
 
 ## Tests
 

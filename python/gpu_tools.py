@@ -459,6 +459,16 @@ def process_label_array_gpu(
     Runs grey_dilation and percentile ops on GPU.
     Falls back to CPU implementation if GPU unavailable or fails.
 
+    NOT YET PORTED: the water/shoreline plausibility checks added to
+    _process_label_array() in dem_water_correction.py (max_water_std_m/
+    max_shore_std_m -- see that function's docstring for the real
+    incident that motivated them). This function still has the old,
+    unguarded behavior. dem_water_correction.py's caller already
+    accounts for this (treats a GPU batch as 0 implausible/flagged
+    rather than erroring), but the actual protection only applies on
+    the CPU path today. Untested here since this needs real GPU
+    hardware to verify.
+
     The GPU speedup is largest for:
       - Large rasters (>5000×5000 pixels) where dilation is expensive
       - Large batches with many valid polygons

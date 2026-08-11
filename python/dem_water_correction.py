@@ -799,6 +799,8 @@ def _process_label_array(
     shore_percentile: float,
     min_water_pixels: int,
     transform=None,
+    max_water_std_m: float = 2.5,
+    max_correction_m: float = 10.0,
 ) -> tuple:
     """
     Optimized replacement for _process_label_array.
@@ -827,14 +829,59 @@ def _process_label_array(
       - Per-label shore_labels assignment is unchanged.
       - corrected[] write is identical.
  
-    Returns same tuple shape as original:
-        (corrected, elevation_changes, corrected_count, skipped_small)
+    Sanity check (added after a real incident: an 8-pixel unnamed
+    "water body" got a -21.1m correction because it wasn't actually a
+    lake -- it was a misclassified sliver sitting on a uniformly steep
+    hillside, confirmed by direct pixel inspection of a real tile. Its
+    own raw elevations spanned 12.2m and its shoreline ring spanned
+    37.4m -- neither remotely plausible for real still water or a real
+    shoreline. Across a full tile's 1,176 corrected bodies, max
+    |correction| shrank monotonically with body size while the median
+    stayed flat, confirming the failure concentrates in small/
+    misclassified bodies where the fixed, non-slope-adaptive
+    buffer_pixels ring samples real terrain instead of a shoreline):
+    reject a body if its candidate correction (surface_elev -
+    orig_mean) is larger than max_correction_m.
+
+    Two alternative designs were tried and reverted after live-testing
+    against a real tile, in favor of gating on the correction itself:
+      - Gating on shore_std (the shoreline ring's own variance): a
+        real alpine lake's ring routinely has 5-9m of legitimate
+        relief (the percentile pick is specifically designed to
+        tolerate that by favoring the ring's low end); an absolute std
+        threshold there flagged 90 real named lakes, 0 confirmed true
+        positives among them.
+      - Gating on water_std (the water body's own raw noise) as a hard
+        block: this has a worse failure mode than shore_std did -- it
+        can't distinguish "genuinely not flat" from "genuinely flat
+        water with noisy raw DEM data" (water surfaces routinely
+        produce noisy lidar/photogrammetric returns). Live-tested: 8
+        real bodies (including a named lake) that would have gotten a
+        perfectly sane 1-10m correction were instead silently left
+        with their noisy raw elevation un-fixed -- the exact failure
+        this exists to prevent, just moved one level down.
+    water_std is still computed and carried through as a non-blocking
+    `low_confidence` marker on applied corrections (see
+    elevation_changes below) -- it's informative for review, just not
+    a reason to withhold a correction the shoreline ring, an
+    independent sample, says is fine.
+
+    A rejected body leaves the original DEM values in place (safer
+    than an arbitrary flattening) and is recorded in flagged_bodies
+    instead of elevation_changes, so it stays visible in the output
+    rather than silently vanishing.
+
+    Returns:
+        (corrected, elevation_changes, corrected_count, skipped_small,
+         skipped_implausible, flagged_bodies)
     """
     from scipy.ndimage import grey_dilation, find_objects
- 
-    elevation_changes = []
-    corrected_count   = 0
-    skipped_small     = 0
+
+    elevation_changes   = []
+    flagged_bodies      = []
+    corrected_count     = 0
+    skipped_small        = 0
+    skipped_implausible  = 0
  
     water_any = label_array > 0
  
@@ -890,29 +937,73 @@ def _process_label_array(
         label_shore_mask = shore_labels == label
         valid = shore_elevs[label_shore_mask]
         valid = valid[(valid > -1000) & (valid < 9000)]
- 
+
         if len(valid) == 0:
             # Fallback: sample inside the water body itself
             inside = corrected[bbox][water_mask_local]
             valid  = inside[inside > -1000]
             if len(valid) == 0:
                 continue
- 
-        surface_elev = float(np.percentile(valid, shore_percentile))
- 
-        # ── Original-mean for stats (using bbox slice) ───────────
+
+        # ── Original values for stats, read BEFORE any write so this
+        # is always the true pre-correction elevation (using bbox slice)
         orig_vals_in_bbox = corrected[bbox][water_mask_local]
         valid_orig = orig_vals_in_bbox[orig_vals_in_bbox > -1000]
         orig_mean  = float(np.mean(valid_orig)) if len(valid_orig) > 0 else 0.0
- 
+        water_std  = float(np.std(valid_orig)) if len(valid_orig) > 1 else 0.0
+        shore_std  = float(np.std(valid))
+
+        name = poly.get('properties', {}).get('name', '')
+        lat, lon = _mask_centroid_latlon(water_mask_local, bbox, transform)
+
+        surface_elev = float(np.percentile(valid, shore_percentile))
+
+        # ── Sanity check: see module-level comment on this function for
+        # the real incident that motivated this ──────────────────────
+        # Gates on the CANDIDATE CORRECTION ITSELF, not on water_std or
+        # shore_std directly -- both were tried as hard gates first and
+        # reverted after live-testing against a real tile:
+        #   - shore_std: a real alpine lake's shoreline ring routinely
+        #     has 5-9m of legitimate relief (the percentile pick is
+        #     specifically designed to tolerate that by favoring the
+        #     ring's low end); an absolute std threshold there flagged
+        #     90 real named lakes with 0 confirmed true positives.
+        #   - water_std: gating on the water body's OWN raw noise has a
+        #     worse failure mode -- it can't distinguish "genuinely not
+        #     flat" from "genuinely flat water with noisy raw DEM data"
+        #     (a well-known problem: water surfaces often produce noisy
+        #     lidar/photogrammetric returns). Live-tested: with water_std
+        #     as a hard gate, 8 real bodies (including a named lake) that
+        #     would have received a perfectly sane 1-10m correction were
+        #     instead silently left with their noisy raw elevation
+        #     un-fixed -- the exact failure this exists to prevent, just
+        #     moved one level down. The shoreline ring is an independent
+        #     sample, uncontaminated by the water body's own noise, so
+        #     checking what it actually produced is both simpler and
+        #     correct; water_std is still computed and reported as a
+        #     `low_confidence` marker on applied corrections, but no
+        #     longer blocks anything by itself.
+        if abs(surface_elev - orig_mean) > max_correction_m:
+            skipped_implausible += 1
+            flagged_bodies.append({
+                'polygon_index': orig_idx, 'name': name,
+                'pixel_count':   pixel_count,
+                'water_std_m':   round(water_std, 1),
+                'shore_std_m':   round(shore_std, 1),
+                'candidate_surface_elev_m': round(surface_elev, 1),
+                'candidate_change_m': round(surface_elev - orig_mean, 1),
+                'reason':        'correction_too_large',
+                'lat':           round(lat, 5) if lat is not None else None,
+                'lon':           round(lon, 5) if lon is not None else None,
+            })
+            continue
+
         # ── Write corrected elevation (using bbox slice) ─────────
         # NB: writing through the slice IS a write-back to the
         # underlying array; numpy slicing returns a view.
         corrected[bbox][water_mask_local] = surface_elev
         corrected_count += 1
- 
-        name = poly.get('properties', {}).get('name', '')
-        lat, lon = _mask_centroid_latlon(water_mask_local, bbox, transform)
+
         elevation_changes.append({
             'polygon_index':   orig_idx,
             'name':            name,
@@ -920,11 +1011,15 @@ def _process_label_array(
             'surface_elev_m':  round(surface_elev, 1),
             'original_mean_m': round(orig_mean, 1),
             'change_m':        round(surface_elev - orig_mean, 1),
+            'water_std_m':     round(water_std, 1),
+            'shore_std_m':     round(shore_std, 1),
+            'low_confidence':  water_std > max_water_std_m,
             'lat':             round(lat, 5) if lat is not None else None,
             'lon':             round(lon, 5) if lon is not None else None,
         })
- 
-    return corrected, elevation_changes, corrected_count, skipped_small
+
+    return (corrected, elevation_changes, corrected_count, skipped_small,
+            skipped_implausible, flagged_bodies)
 
 # ─────────────────────────────────────────────
 # Core correction function — batch rasterization
@@ -936,9 +1031,11 @@ def correct_dem_water_bodies(
     water_polygons: list[dict],
     buffer_pixels: int = 3,
     shore_percentile: float = 10.0,
-    min_water_pixels: int = 5,
+    min_water_pixels: int = 12,
     batch_size: int = 500,
     verbose: bool = True,
+    max_water_std_m: float = 2.5,
+    max_correction_m: float = 10.0,
 ) -> dict:
     """
     Apply water body elevation correction to a DEM GeoTIFF.
@@ -964,21 +1061,37 @@ def correct_dem_water_bodies(
         min_water_pixels: Skip polygons smaller than this (noise filter)
         batch_size:       Polygons per rasterization batch (default 500)
         verbose:          Print per-batch progress
+        max_water_std_m:  Non-blocking -- marks a corrected body
+                           'low_confidence' if its own raw elevations
+                           varied by more than this before correction.
+                           Does NOT withhold the correction; see
+                           _process_label_array()'s docstring for why
+                           (gating on this directly was tried and
+                           reverted after live-testing).
+        max_correction_m: Skip (flag) a body if the candidate
+                           correction it computed is larger than this
+                           -- see _process_label_array()'s docstring
+                           for why this checks the correction itself
+                           rather than the shoreline ring's variance.
 
     Returns:
-        Statistics dict with correction counts and elevation ranges
+        Statistics dict with correction counts, elevation ranges, and
+        a 'flagged_bodies' list of bodies skipped for implausibility
+        (see _process_label_array())
     """
     import rasterio.features
 
     stats = {
-        'total_polygons':     len(water_polygons),
-        'corrected_bodies':   0,
-        'skipped_small':      0,
-        'skipped_no_overlap': 0,
-        'total_pixels_fixed': 0,
-        'elevation_changes':  [],
-        'batch_size':         batch_size,
-        'n_batches':          0,
+        'total_polygons':      len(water_polygons),
+        'corrected_bodies':    0,
+        'skipped_small':       0,
+        'skipped_implausible': 0,
+        'skipped_no_overlap':  0,
+        'total_pixels_fixed':  0,
+        'elevation_changes':   [],
+        'flagged_bodies':      [],
+        'batch_size':          batch_size,
+        'n_batches':           0,
     }
 
     with rasterio.open(input_path) as src:
@@ -1160,30 +1273,41 @@ def correct_dem_water_bodies(
                     buffer_pixels, shore_percentile, min_water_pixels,
                     transform=crop_transform,
                 )
+            # process_label_array_gpu() doesn't have the water/shoreline
+            # plausibility checks below yet (see _process_label_array()'s
+            # docstring for why they exist) -- GPU runs get the old,
+            # unguarded behavior until that's ported too.
+            n_skipped_implausible, batch_flagged = 0, []
         else:
             if _use_gpu:
                 print(f"[GPU] Crop {crop_mb:.0f}MB exceeds budget, "
                       f"using CPU", end=' ', flush=True)
-            corrected_crop, batch_changes, n_corrected, n_skipped = \
+            (corrected_crop, batch_changes, n_corrected, n_skipped,
+             n_skipped_implausible, batch_flagged) = \
                 _process_label_array(
                     label_crop, corrected_crop, batch,
                     buffer_pixels, shore_percentile, min_water_pixels,
                     transform=crop_transform,
+                    max_water_std_m=max_water_std_m,
+                    max_correction_m=max_correction_m,
                 )
 
         # Write crop result back to full array
         corrected[r_min:r_max, c_min:c_max] = corrected_crop
 
         elapsed_batch = time.perf_counter() - t_batch
-        stats['corrected_bodies']   += n_corrected
-        stats['skipped_small']      += n_skipped
-        stats['total_pixels_fixed'] += sum(
+        stats['corrected_bodies']    += n_corrected
+        stats['skipped_small']       += n_skipped
+        stats['skipped_implausible'] += n_skipped_implausible
+        stats['total_pixels_fixed']  += sum(
             c['pixel_count'] for c in batch_changes)
         stats['elevation_changes'].extend(batch_changes)
-        stats['n_batches']          += 1
+        stats['flagged_bodies'].extend(batch_flagged)
+        stats['n_batches']           += 1
 
         if verbose:
-            print(f"{n_corrected} corrected, {n_skipped} too small "
+            print(f"{n_corrected} corrected, {n_skipped} too small, "
+                  f"{n_skipped_implausible} implausible "
                   f"({elapsed_batch:.1f}s)")
 
     # ── Write output ───────────────────────────────────────────────────
@@ -1201,10 +1325,11 @@ def correct_dem_water_bodies(
     print(f"\n[CORRECT] Summary ({accel}):")
     print(f"  Batches processed:    {stats['n_batches']} "
           f"(batch size {batch_size})")
-    print(f"  Corrected bodies:     {stats['corrected_bodies']}")
-    print(f"  Skipped (too small):  {stats['skipped_small']}")
-    print(f"  Skipped (no overlap): {stats['skipped_no_overlap']}")
-    print(f"  Total pixels fixed:   {stats['total_pixels_fixed']:,}")
+    print(f"  Corrected bodies:      {stats['corrected_bodies']}")
+    print(f"  Skipped (too small):   {stats['skipped_small']}")
+    print(f"  Skipped (implausible): {stats['skipped_implausible']}")
+    print(f"  Skipped (no overlap):  {stats['skipped_no_overlap']}")
+    print(f"  Total pixels fixed:    {stats['total_pixels_fixed']:,}")
     print(f"  Output: {output_path}")
 
     return stats
@@ -1232,6 +1357,13 @@ def _parallel_worker(
     water body polygons, and returns a list of correction records
     (pixel coordinates + surface elevation) rather than modifying
     the array directly (workers cannot write to shared memory safely).
+
+    NOT YET PORTED: this duplicates _process_label_array()'s core
+    logic independently rather than calling it, so it also doesn't
+    have the water/shoreline plausibility checks added there (see that
+    function's docstring for the real incident that motivated them --
+    the exact same fixed, non-slope-adaptive buffer_pixels sampling is
+    used here, so the same failure mode applies).
 
     Returns list of dicts: {rows: [...], cols: [...], surface_elev: float}
     """
