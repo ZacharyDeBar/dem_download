@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# DEM outputs (large binaries — not meant for version control)
+data/
+dem_cache/
+raster_tmp/
+*.tif
+*.tiff
+*.png
+*.geojson
+tile_registry.json
+
+# ...except the committed example report image for the README
+!docs/example_report.png
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# Claude Code local session settings (machine-local, not shared config)
+.claude/settings.local.json
