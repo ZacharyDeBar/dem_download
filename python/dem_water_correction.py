@@ -262,8 +262,18 @@ def fetch_water_bodies_nhd(
             props = feat.get('properties', {}) or {}
             props_lower = {k.lower(): v for k, v in props.items()}
             ftype = props_lower.get('ftype')
+            # NHD_STILL_WATER_FTYPES is a set of int codes; the service
+            # has been observed returning FType as a native JSON number,
+            # but coerce defensively in case a service version ever
+            # returns it as a numeric string -- a bare `not in` against
+            # int literals would then silently drop every real
+            # LakePond/Reservoir/Estuary.
+            try:
+                ftype_code = int(ftype) if ftype is not None else None
+            except (TypeError, ValueError):
+                ftype_code = None
 
-            if still_water_only and ftype not in NHD_STILL_WATER_FTYPES:
+            if still_water_only and ftype_code not in NHD_STILL_WATER_FTYPES:
                 n_filtered_ftype += 1
                 continue
 
