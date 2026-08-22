@@ -16,7 +16,7 @@ over the result:
 
 | Script | Purpose |
 |---|---|
-| [`dem_download.py`](python/dem_download.py) | Downloads and mosaics the best available DEM tiles for a study area (3DEP 1m → 3DEP 10m → GLO-30, in priority order). |
+| [`dem_download.py`](python/dem_download.py) | Downloads and mosaics the best available DEM tiles for a study area. Default cascade: 3DEP 10m → GLO-30. 3DEP 1m is opt-in only (`--try-1m` / `--resolution 1m`) — coverage is sparse and the raw fetch is expensive to store, so it's not run by default; when used, it's fetched via USGS WCS and resampled onto the same 10m-equivalent grid with area averaging, not left at native resolution. |
 | [`build_dem_mosaic.py`](python/build_dem_mosaic.py) | Higher-level driver: downloads a source (GLO-30 or 3DEP) and produces one water-corrected mosaic GeoTIFF. |
 | [`dem_water_correction.py`](python/dem_water_correction.py) | Flattens elevation noise inside still-water bodies (lakes, ponds, reservoirs) by sampling shoreline elevation and flood-filling, using NHD (US) or OpenStreetMap (global) water polygons. |
 | [`repair_dem_gaps.py`](python/repair_dem_gaps.py) | Finds nodata/zero gaps in an already-built mosaic and backfills them from GLO-30, then re-applies water correction. |
@@ -161,6 +161,7 @@ python test_tile_registry.py
 python test_storage_manager.py
 python test_tile_validation.py
 python test_tile_builder.py
+python test_dem_download_1m.py
 ```
 
 `test_tile_builder.py` stubs out the flat pipeline scripts (`dem_download`,
