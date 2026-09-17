@@ -231,6 +231,31 @@ def _get_3dep_url(lat: float, lng: float, resolution: int) -> str:
     return base + params
 
 
+def _fetch_wcs_geotiff_bytes(url: str, timeout: int = 120, retries: int = 5,
+                              label: str = "") -> "bytes | None":
+    """
+    GET a WCS GetCoverage URL expecting a GeoTIFF response, with
+    exponential-backoff retries. Returns the raw bytes on success,
+    None if every attempt failed or the response wasn't a real TIFF
+    (e.g. an XML error body). Shared by every WCS sub-tile fetcher in
+    this module so the retry/backoff policy lives in exactly one place.
+    """
+    tag = f" {label}" if label else ""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 200:
+                data = r.content
+                if data[:4] in (b'II*\x00', b'MM\x00*', b'II+\x00'):
+                    return data
+            print(f"[3DEP] Sub-tile{tag} attempt {attempt+1} "
+                  f"status={r.status_code}")
+        except Exception as e:
+            print(f"[3DEP] Sub-tile{tag} attempt {attempt+1} error: {e}")
+        time.sleep(1 + attempt * 2)  # exponential backoff
+    return None
+
+
 def _download_tile_3dep_subtiled(
     lat_floor: int,
     lng_floor: int,
@@ -295,20 +320,9 @@ def _download_tile_3dep_subtiled(
         url = (base_url +
                f"&BBOX={xmin},{ymin},{xmax},{ymax}"
                f"&WIDTH={subtile_px}&HEIGHT={subtile_px}")
-        for attempt in range(5):
-            try:
-                r = requests.get(url, timeout=timeout)
-                if r.status_code == 200:
-                    data = r.content
-                    if data[:4] in (b'II*\x00', b'MM\x00*', b'II+\x00'):
-                        return (row, col, data)
-                print(f"[3DEP] Sub-tile ({row},{col}) "
-                      f"attempt {attempt+1} status={r.status_code}")
-            except Exception as e:
-                print(f"[3DEP] Sub-tile ({row},{col}) "
-                      f"attempt {attempt+1} error: {e}")
-            time.sleep(1 + attempt * 2)  # exponential backoff
-        return (row, col, None)
+        data = _fetch_wcs_geotiff_bytes(url, timeout=timeout,
+                                         label=f"({row},{col})")
+        return (row, col, data)
 
     # Download all sub-tiles in parallel
     results = {}
@@ -506,6 +520,209 @@ def _download_tile_3dep_subtiled(
           f"({size_mb:.1f}MB, {elapsed:.0f}s total)")
     _enforce_cache_cap(protect=local_path)
     return local_path
+
+
+# ─────────────────────────────────────────────
+# True native-resolution (~1m/px) fetch
+# ─────────────────────────────────────────────
+# _download_tile_3dep_subtiled (above) tops out at ~3m/px (36000px per
+# 1-degree tile) because it assembles every sub-tile into one
+# in-memory array via rasterio.merge.merge() before writing -- fine at
+# that scale (~5GB), but genuine ~1m/px for a 1-degree tile is
+# ~111000x111000px, which would need ~50GB of RAM the same way. The
+# function below instead pre-creates the output file at its final
+# shape and writes each sub-tile directly into its own window as it
+# arrives, so memory stays bounded to one sub-tile at a time
+# regardless of the tile's total size.
+#
+# It also skips sub-tiles that a coverage probe (see
+# probe_3dep_1m_coverage_grid below) already showed have no real 3DEP
+# 1m data -- coverage is sparse (surveyed urban/project areas only),
+# so most of a given 1-degree tile commonly has none at all, and
+# there's no reason to spend a full-size WCS request finding that out
+# sub-tile by sub-tile.
+
+# Empirically confirmed live against this WCS endpoint (2026-09):
+# WIDTH/HEIGHT=2800 succeeds, 2900+ returns HTTP 400. 2000 is used here
+# to leave real margin rather than sit right at that edge.
+NATIVE_1M_SUBTILE_PX = 2000
+_METERS_PER_DEGREE_LAT = 111_320  # ~constant; this pipeline's degree
+                                    # grids don't correct for the
+                                    # longitude-direction cos(lat)
+                                    # shrink either (same as every
+                                    # other tier here)
+NATIVE_1M_GRID_N = math.ceil(_METERS_PER_DEGREE_LAT / NATIVE_1M_SUBTILE_PX)  # 56
+NATIVE_1M_PROBE_GRID_N = 10  # coarse coverage-probe grid; see
+                              # dem_download.probe_3dep_1m_coverage_grid
+
+
+def _download_tile_3dep_native(
+    lat_floor: int,
+    lng_floor: int,
+    out_path: Path,
+    coverage_grid=None,
+    grid_n: int = NATIVE_1M_GRID_N,
+    subtile_px: int = NATIVE_1M_SUBTILE_PX,
+    max_workers: int = 6,
+    timeout: int = 60,
+) -> Path:
+    """
+    Fetch a full 1-degree 3DEP tile at ~1m/px by requesting a
+    grid_n x grid_n grid of subtile_px x subtile_px sub-tiles and
+    writing each directly into its destination window in `out_path`
+    -- never assembling the whole tile in memory (see module comment
+    above for why that matters at this scale).
+
+    coverage_grid: optional (coarse_grid_n, bool ndarray) from
+    dem_download.probe_3dep_1m_coverage_grid(). Any fine sub-tile whose
+    bbox doesn't overlap a covered coarse cell is left as nodata
+    without being fetched at all. Pass None to fetch every sub-tile
+    unconditionally (only sensible for small test grids).
+
+    Unlike _download_tile_3dep_subtiled, this does NOT gap-fill failed
+    sub-tiles from GLO-30 -- that step reads the whole assembled array
+    back into memory, which defeats the point here. It also isn't
+    needed: this raster is only ever consumed as a VRT overlay
+    (build_hires_vrt.py) on top of the always-complete standard
+    mosaic, and the VRT already treats overlay nodata as transparent
+    -- a failed sub-tile just shows the normal mosaic value through
+    the VRT instead of a hole. A sub-tile that fails after retries is
+    simply left as nodata here.
+
+    Returns out_path. Raises if the WCS response for a covered
+    sub-tile can't be decoded as a raster (distinct from a plain fetch
+    failure, which just leaves that window as nodata).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject
+    from rasterio.enums import Resampling
+    from rasterio.windows import Window
+
+    base_url = (
+        "https://elevation.nationalmap.gov/arcgis/services/"
+        "3DEPElevation/ImageServer/WCSServer"
+        "?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage"
+        "&COVERAGE=DEP3Elevation&CRS=EPSG:4326&FORMAT=GeoTIFF"
+    )
+
+    nodata = -9999.0
+    total_px = grid_n * subtile_px
+    tile_transform = from_bounds(
+        lng_floor, lat_floor, lng_floor + 1, lat_floor + 1,
+        total_px, total_px)
+
+    profile = {
+        'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+        'width': total_px, 'height': total_px, 'crs': 'EPSG:4326',
+        'transform': tile_transform, 'nodata': nodata,
+        'compress': 'deflate', 'predictor': 2, 'tiled': True,
+        'blockxsize': 512, 'blockysize': 512, 'BIGTIFF': 'YES',
+    }
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    coarse_grid_n, coarse_coverage = (coverage_grid
+                                       if coverage_grid is not None
+                                       else (1, np.array([[True]])))
+
+    def coarse_cell_for(frac_lo, frac_hi):
+        """Coarse row/col span (inclusive) a [0,1) fractional-tile
+        range of pixels overlaps, for coverage_grid lookups."""
+        lo = min(int(frac_lo * coarse_grid_n), coarse_grid_n - 1)
+        hi = min(int(math.ceil(frac_hi * coarse_grid_n)) , coarse_grid_n)
+        return lo, max(hi, lo + 1)
+
+    step = 1.0 / grid_n
+    subtiles = []       # (row, col, xmin, ymin, xmax, ymax) to fetch
+    n_skipped = 0
+    blank = np.full((subtile_px, subtile_px), nodata, dtype=np.float32)
+
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        for row in range(grid_n):
+            for col in range(grid_n):
+                xmin = lng_floor + col * step
+                xmax = lng_floor + (col + 1) * step
+                ymin = lat_floor + row * step
+                ymax = lat_floor + (row + 1) * step
+
+                col_lo, col_hi = coarse_cell_for(col / grid_n, (col + 1) / grid_n)
+                row_lo, row_hi = coarse_cell_for(row / grid_n, (row + 1) / grid_n)
+                covered = bool(coarse_coverage[row_lo:row_hi, col_lo:col_hi].any())
+
+                # Row is geographic (south-up); GeoTIFF rows are
+                # north-down, so row 0 of the raster is the tile's
+                # northernmost strip.
+                dst_row = grid_n - 1 - row
+                window = Window(col * subtile_px, dst_row * subtile_px,
+                                 subtile_px, subtile_px)
+
+                if not covered:
+                    n_skipped += 1
+                    dst.write(blank, 1, window=window)
+                    continue
+
+                subtiles.append((row, col, xmin, ymin, xmax, ymax, window))
+
+        print(f"[3DEP-native] N{lat_floor}W{-lng_floor}: "
+              f"{len(subtiles)} sub-tile(s) to fetch, {n_skipped} skipped "
+              f"(no probed coverage) of {grid_n*grid_n} total")
+
+        def fetch_one(args):
+            row, col, xmin, ymin, xmax, ymax, window = args
+            url = (base_url + f"&BBOX={xmin},{ymin},{xmax},{ymax}"
+                   f"&WIDTH={subtile_px}&HEIGHT={subtile_px}")
+            data = _fetch_wcs_geotiff_bytes(url, timeout=timeout,
+                                             label=f"({row},{col})")
+            return window, data
+
+        n_fetched = n_failed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_one, s) for s in subtiles]
+            completed = 0
+            t0 = time.time()
+            for future in as_completed(futures):
+                window, data = future.result()
+                completed += 1
+                if data is None:
+                    n_failed += 1
+                    dst.write(blank, 1, window=window)
+                else:
+                    with rasterio.io.MemoryFile(data) as mf, mf.open() as src:
+                        src_arr = src.read(1).astype(np.float32)
+                        src_nodata = (src.nodata if src.nodata is not None
+                                      else nodata)
+                        dst_arr = np.full((subtile_px, subtile_px), nodata,
+                                           dtype=np.float32)
+                        # Snap onto this window's exact bounds rather
+                        # than trusting the response's own returned
+                        # georeferencing to land exactly on the
+                        # requested bbox -- same rationale as
+                        # _download_tile_3dep_subtiled's grid-snap.
+                        window_transform = dst.window_transform(window)
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=dst_arr,
+                            src_transform=src.transform, src_crs=src.crs,
+                            dst_transform=window_transform, dst_crs='EPSG:4326',
+                            src_nodata=src_nodata, dst_nodata=nodata,
+                            resampling=Resampling.nearest,
+                        )
+                    dst.write(dst_arr, 1, window=window)
+                    n_fetched += 1
+                if completed % 50 == 0 or completed == len(subtiles):
+                    elapsed = time.time() - t0
+                    rate = completed / max(elapsed, 0.001)
+                    eta = (len(subtiles) - completed) / max(rate, 0.001)
+                    print(f"[3DEP-native] {completed}/{len(subtiles)} "
+                          f"fetched ({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+
+    print(f"[3DEP-native] Done: {n_fetched} fetched, {n_failed} failed "
+          f"(left nodata), {n_skipped} skipped -- {out_path.name} "
+          f"({out_path.stat().st_size/1e6:.1f}MB)")
+    return out_path
+
 
 def download_tile_3dep(lat: float, lng: float, resolution: int = 10) -> Path:
     if not _is_in_3dep_coverage(lat, lng):

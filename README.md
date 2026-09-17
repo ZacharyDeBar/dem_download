@@ -2,21 +2,23 @@
 
 Downloads, repairs, and mosaics Digital Elevation Model (DEM) data from public
 US and global sources, and turns it into a validated, cache-managed tile
-corpus suitable for large-scale terrain compute.
+corpus.
 
-This is an extracted slice of the DEM-preparation layer from a larger private
-project.
+
+**New here?** See [QUICKSTART.md](QUICKSTART.md) to get a first download
+running. Everything below is the full reference.
 
 ## What it does
 
-Two generations of code live here, in the order they were built:
+Two approaches:
 
-**1. Flat pipeline scripts** — download a DEM for a latitude-longitude grid spanning input diagonal corners, then run standalone repair/correction passes
+**1. Designated mosaic scripts** — download a DEM for a latitude-longitude grid spanning input diagonal corners, then run standalone repair/correction passes
 over the result:
 
 | Script | Purpose |
 |---|---|
-| [`dem_download.py`](python/dem_download.py) | Downloads and mosaics the best available DEM tiles for a study area. Default cascade: 3DEP 10m → GLO-30. 3DEP 1m is opt-in only (`--try-1m` / `--resolution 1m`) — coverage is sparse and the raw fetch is expensive to store, so it's not run by default; when used, it's fetched via USGS WCS and resampled onto the same 10m-equivalent grid with area averaging, not left at native resolution. |
+| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output) below. |
+| [`build_hires_vrt.py`](python/build_hires_vrt.py) | Builds the `.vrt` described above: layers one or more higher-resolution rasters over a lower-resolution base so a single file samples fine detail where available and the base resolution elsewhere. |
 | [`build_dem_mosaic.py`](python/build_dem_mosaic.py) | Higher-level driver: downloads a source (GLO-30 or 3DEP) and produces one water-corrected mosaic GeoTIFF. |
 | [`dem_water_correction.py`](python/dem_water_correction.py) | Flattens elevation noise inside still-water bodies (lakes, ponds, reservoirs) by sampling shoreline elevation and flood-filling, using NHD (US) or OpenStreetMap (global) water polygons. |
 | [`repair_dem_gaps.py`](python/repair_dem_gaps.py) | Finds nodata/zero gaps in an already-built mosaic and backfills them from GLO-30, then re-applies water correction. |
@@ -73,6 +75,10 @@ python python/dem_download.py --bounds 44,-113,47,-109  # fractional-degree alte
 python python/build_dem_mosaic.py N44W113 N47W109
 python python/build_dem_mosaic.py --bounds 44 -113 47 -109 --output my_area.tif
 
+# Same, but also fetch real fine-detail coverage where it exists --
+# see "High-resolution output" below.
+python python/dem_download.py N44W113 N47W109 --try-3m
+
 # Build one 1°x1° tile end-to-end into a local tile cache. --storage-root
 # is the cache root, not the tiles dir itself — the tile lands at
 # data/tiles/N45W110/ (registry + downloads/ also live under data/).
@@ -102,6 +108,48 @@ roughly 200-300MB. See `bounds_from_tile_corners()` in `tile_id.py`.
 
 Run any script with `--help` for its full option list — all of them are
 self-documenting argparse CLIs.
+
+## High-resolution output
+
+Two opt-in tiers fetch USGS 3DEP's finest data wherever it's actually
+surveyed (coverage is sparse — most areas have none):
+
+| | `--try-3m` | `--resolution 1m` |
+|---|---|---|
+| Actual resolution | ~3m/px | genuine ~1m/px |
+| Requests per tile | 900 | up to ~3,100 (coverage-probed first, so mostly-uncovered tiles cost far less) |
+| Time per tile | a few minutes | tens of minutes for a well-covered tile |
+
+`--try-3m` requests a 30×30 grid of sub-tiles (900 requests) rather than the
+true native grid — the true grid for a 1° tile would be ~111000×111000px,
+impractical to request this way — so what comes back is ~3m/px, not literally
+1m/px despite pulling from USGS's 3DEP "1m" product. That's a deliberate
+tradeoff already built into this codebase, not a confirmed hard limit of the
+WCS server.
+
+`--resolution 1m` goes further: genuine ~1m/px, streamed straight to disk one
+small piece at a time instead of assembled in memory (the naive approach
+would need ~50GB of RAM for one tile). Before fetching, it probes a coarse
+grid over the tile and skips any region that clearly has no coverage, so a
+tile with limited real coverage doesn't pay for thousands of pointless
+requests. It's a separate, more expensive tier from `--try-3m` — request it
+explicitly; it's never triggered by `--try-3m` or the default `best` cascade,
+and it never uses the ~3m tier as an intermediate step either. A tile with no
+1m coverage at all falls back to the normal 10m/GLO-30 cascade instead of
+being left out of the area mosaic — the point of `--resolution 1m` over a
+whole study area is real detail where it exists, not an all-or-nothing
+demand that leaves holes everywhere else.
+
+Whichever tier finds real coverage, `dem_download.py` writes one extra file
+next to the usual mosaic: `<name>_mosaic_hires.vrt`. Open it exactly like a
+GeoTIFF (QGIS, `gdalinfo`, `rasterio.open(...)`) — it reads real high-resolution
+detail wherever it was fetched and the normal mosaic everywhere else, with no
+resampling or extra storage cost. It's a small text file that references the
+mosaic `.tif` and the native tile(s) by relative path, so keep them together
+in the same folder.
+
+Not wired up yet: `tile_builder.py`'s `--source` doesn't expose either
+high-resolution tier, and `build_dem_mosaic.py` doesn't have `--try-3m` either.
 
 ## Visualizing a tile
 
@@ -161,7 +209,9 @@ python test_tile_registry.py
 python test_storage_manager.py
 python test_tile_validation.py
 python test_tile_builder.py
+python test_dem_download_3m.py
 python test_dem_download_1m.py
+python test_build_hires_vrt.py
 ```
 
 `test_tile_builder.py` stubs out the flat pipeline scripts (`dem_download`,
@@ -184,10 +234,6 @@ truncated-download detection gap that **also existed in this repo's
 own Python original** and a 3DEP
 sub-tile grid-alignment issue that, before the fix, made the two
 ports' output for the same real area disagree on a majority of pixels.
-
-## Scope / known gaps
-
-This repo is a working slice of a larger pipeline. It can serve as a useful data input tool in terrain analyses.
 
 ## Data sources
 

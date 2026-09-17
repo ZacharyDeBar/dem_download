@@ -1,0 +1,12 @@
+# R does not have a pip-style requirements.txt, but this lists the same
+# information for anyone scanning the repo for dependencies.
+# Install with:
+#   Rscript -e 'install.packages(c("terra", "httr2", "jsonlite", "maps"))'
+terra
+httr2
+jsonlite
+maps
+
+# Optional (see r/README.md#dependency-notes):
+# sf   -- needed only for the coastline-aware ocean-polygon fallback in
+#          dem_water_correction.R; also needs the system library libudunits2

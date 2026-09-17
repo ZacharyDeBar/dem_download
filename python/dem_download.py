@@ -5,18 +5,43 @@ Downloads the highest available resolution DEM tiles for a study area
 and mosaics them into a single GeoTIFF.
 
 Resolution priority per tile (US coverage):
-  1. 3DEP 1m   -- where available (urban/surveyed areas). Opt-in only
-                  (--try-1m or --resolution 1m) -- coverage is sparse
-                  and the raw fetch is expensive to store, so this is
-                  NOT part of the default 'best' cascade. Fetched via
-                  USGS WCS (elevation.py's sub-tile fetcher, reused
-                  here), then resampled DOWN onto the canonical
-                  10800x10800 grid with area averaging -- a
-                  higher-fidelity INPUT source, not a different
-                  output resolution (same treatment GLO-30 already
-                  gets on the other end of the cascade). A cheap
-                  probe checks for real coverage before the full
-                  81-request fetch.
+  1. 3DEP ~3m  -- where available (urban/surveyed areas). Opt-in only
+                  (--try-3m or --resolution 3m) -- coverage is sparse
+                  and the raw fetch is expensive, so this is NOT part
+                  of the default 'best' cascade. Fetched via USGS WCS
+                  (elevation.py's sub-tile fetcher, reused here) as a
+                  36000x36000px grid -- NOT literally 1m/px despite
+                  pulling from USGS's 3DEP "1m" product: this is a
+                  deliberate tradeoff in how the fetch is shaped (a
+                  cheap 900-request grid), not a confirmed hard limit
+                  of the WCS server itself. Resampled DOWN onto the
+                  canonical 10800x10800 grid with area averaging for
+                  the main mosaic (a higher-fidelity INPUT there, not
+                  a different output resolution -- same treatment
+                  GLO-30 already gets on the other end of the
+                  cascade), AND kept at its own ~3m resolution,
+                  layered over the final mosaic as a
+                  `<name>_mosaic_hires.vrt` -- real fine detail where
+                  it was actually fetched, the normal mosaic
+                  everywhere else. A cheap probe checks for real
+                  coverage before the full 900-request sub-tile fetch.
+  1b. 3DEP 1m  -- genuine ~1m/px, not the ~3m/px above. Streams
+                  straight to disk window-by-window instead of
+                  assembling the whole tile in memory (~50GB as one
+                  array at this scale) -- see
+                  elevation._download_tile_3dep_native. Probes a
+                  coarse coverage grid first (probe_3dep_1m_coverage_grid)
+                  and skips sub-tiles over confirmed-uncovered ground
+                  rather than fetching them. Still up to ~3100 WCS
+                  requests and tens of minutes for a well-covered tile.
+                  Explicit opt-in only (--resolution 1m) -- never
+                  tried under 'best' or --try-3m. Unlike every other
+                  resolution here, a tile with no 1m coverage falls
+                  back to the normal 10m/GLO-30 cascade below (never
+                  to the 3m tier) rather than being left out of the
+                  area mosaic entirely -- the point of requesting 1m
+                  for a whole area is real detail where it exists, not
+                  an all-or-nothing demand.
   2. 3DEP 10m  -- broad US coverage, direct download (the default
                   first tier under 'best')
   3. GLO-30    -- global fallback (Copernicus 30m)
@@ -46,6 +71,7 @@ Usage:
 import argparse
 import json
 import math
+import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,6 +88,7 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
 from tile_id import bounds_from_tile_corners, MAX_MOSAIC_TILES
+from build_hires_vrt import build_hires_vrt
 
 
 # ─────────────────────────────────────────────
@@ -238,18 +265,18 @@ def resolve_10m_url(lat, lng):
 
 
 # ─────────────────────────────────────────────
-# 3DEP 1m (WCS, sparse coverage) — resampled onto the canonical grid
+# 3DEP ~3m / genuine 1m (WCS, sparse coverage)
 # ─────────────────────────────────────────────
-# 1m isn't a direct-URL download like 10m -- USGS only serves it via
-# WCS, fetched as a 9x9 grid of sub-tile requests and merged
-# (elevation.py's _download_tile_3dep_subtiled, already built/tested
-# for the on-demand single-point lookup, reused here rather than
-# duplicated). Coverage is sparse (surveyed/urban areas only) and the
-# raw fetch is expensive to store even though the final tile lands at
-# the same size as everything else, so this is opt-in only (try_1m or
-# an explicit resolution='1m') -- NOT part of the default 'best'
-# cascade every normal build uses. A cheap single-request probe runs
-# first when it is requested, so the full 81-request grid is only
+# Neither is a direct-URL download like 10m -- USGS only serves this
+# tier via WCS, fetched as a grid of sub-tile requests
+# (elevation.py's _download_tile_3dep_subtiled for the ~3m tier,
+# already built/tested for the on-demand single-point lookup and
+# reused here; _download_tile_3dep_native for the genuine 1m tier).
+# Coverage is sparse (surveyed/urban areas only) and the raw fetch is
+# expensive, so both are opt-in only (try_3m/resolution='3m', or the
+# much more expensive resolution='1m') -- NOT part of the default
+# 'best' cascade every normal build uses. A cheap single-request probe
+# runs first in both cases, so the full sub-tile grid is only
 # attempted where the probe finds real data.
 
 _3DEP_WCS_BASE = (
@@ -263,30 +290,83 @@ _1M_PROBE_PX = 64          # small request -- cheap, but big enough that
                             # landing near a coverage seam still reads
                             # some real data if any is nearby
 _1M_PROBE_HALF_DEG = 0.0005  # ~100m at mid-latitudes
-_1M_CANONICAL_GRID_PX = 10800  # matches tile_builder.py's downstream
+_CANONICAL_GRID_PX = 10800  # matches tile_builder.py's downstream
                                  # canonical-grid convention (1/10800
                                  # deg/px)
-_1M_DEGRADED_WIDTH_THRESHOLD_PX = 50_000  # a real 1m sub-tiled fetch is
-                                            # ~108000px wide; well below
+_3M_GRID_N = 30            # sub-tile grid for the 1m tier -- matches
+_3M_SUBTILE_PX = 1200      # elevation.py's own download_tile_3dep()
+                            # resolution=1 branch (grid_n=30,
+                            # subtile_px=1200 -> 36000x36000px, ~3m/px).
+                            # _download_tile_3dep_subtiled's own
+                            # `resolution` kwarg is a print label only --
+                            # grid_n/subtile_px are what actually control
+                            # the request grid, so both must be passed
+                            # explicitly here.
+_3M_DEGRADED_WIDTH_THRESHOLD_PX = 25_000  # a real 1m sub-tiled fetch is
+                                            # 36000px wide (_3M_GRID_N *
+                                            # _3M_SUBTILE_PX); well below
                                             # that means the internal
                                             # GLO-30 fallback fired
 
 
-def _probe_3dep_1m_coverage(lat_floor: int, lng_floor: int,
-                             timeout: int = 15) -> bool:
+def _resample_native_to_canonical_grid(native_path, lat_floor: int,
+                                        lng_floor: int, out_path,
+                                        grid_px: int = None) -> None:
     """
-    Cheap single-request check for 3DEP 1m coverage near this tile's
-    center, before committing to the full 81-request sub-tile grid
-    _download_tile_3dep_subtiled needs. Returns True only if at least
-    half the probe window came back as real (non-nodata) elevation --
-    a handful of stray valid pixels at a coverage boundary shouldn't
-    trigger the expensive full fetch.
+    Area-average a native-resolution raster covering one 1-degree
+    tile DOWN onto this pipeline's canonical grid (default
+    _CANONICAL_GRID_PX, i.e. the same 10800x10800 lattice every
+    other source uses) and write it to `out_path`. Shared by the ~3m
+    tier (download_tile_3dep_3m) and the true ~1m tier
+    (download_tile_3dep_1m) -- both need the exact same
+    "higher-fidelity input, same output grid" treatment for the
+    standard mosaic. Area averaging (not bilinear) is correct here
+    because we're downsampling real measured data, not upsampling a
+    coarser source (see download_tile_3dep_3m's docstring for why that
+    distinction matters).
     """
-    cx, cy = lng_floor + 0.5, lat_floor + 0.5
-    h = _1M_PROBE_HALF_DEG
+    grid_px = grid_px or _CANONICAL_GRID_PX
+    w, s, e, n = lng_floor, lat_floor, lng_floor + 1, lat_floor + 1
+    with rasterio.open(native_path) as src:
+        nodata = src.nodata if src.nodata is not None else -9999.0
+        dst_transform = rasterio.transform.from_bounds(w, s, e, n, grid_px, grid_px)
+        dst_data = np.full((grid_px, grid_px), nodata, dtype=np.float32)
+        rasterio.warp.reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=CRS.from_epsg(4326),
+            src_nodata=src.nodata,
+            dst_nodata=nodata,
+            resampling=Resampling.average,
+        )
+        profile = {
+            'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+            'width': grid_px, 'height': grid_px,
+            'crs': 'EPSG:4326', 'transform': dst_transform,
+            'compress': 'deflate', 'BIGTIFF': 'YES',
+            'nodata': nodata,
+        }
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(dst_data, 1)
+
+
+def _probe_3dep_coverage_bbox(west: float, south: float, east: float,
+                               north: float, probe_px: int = _1M_PROBE_PX,
+                               timeout: int = 15) -> bool:
+    """
+    Cheap single-request check for real (non-nodata) 3DEP 1m coverage
+    inside an arbitrary bbox. Returns True only if at least half the
+    probe window came back as real elevation -- a handful of stray
+    valid pixels at a coverage boundary shouldn't count as "covered".
+    Shared by both the whole-tile probe and the coarse per-cell grid
+    probe below.
+    """
     url = (_3DEP_WCS_BASE +
-           f"&BBOX={cx-h},{cy-h},{cx+h},{cy+h}"
-           f"&WIDTH={_1M_PROBE_PX}&HEIGHT={_1M_PROBE_PX}")
+           f"&BBOX={west},{south},{east},{north}"
+           f"&WIDTH={probe_px}&HEIGHT={probe_px}")
     try:
         resp = requests.get(url, timeout=timeout)
         if resp.status_code != 200:
@@ -303,25 +383,95 @@ def _probe_3dep_1m_coverage(lat_floor: int, lng_floor: int,
         return False
 
 
-def download_tile_3dep_1m(lat, lng, output_dir):
+def _probe_3dep_1m_coverage(lat_floor: int, lng_floor: int,
+                             timeout: int = 15) -> bool:
     """
-    Attempt the 3DEP 1m tier for one 1-degree tile: probe for
+    Cheap single-request check for 3DEP 1m coverage near this tile's
+    center, before committing to a full sub-tile grid fetch. See
+    _probe_3dep_coverage_bbox for the actual check.
+    """
+    cx, cy = lng_floor + 0.5, lat_floor + 0.5
+    h = _1M_PROBE_HALF_DEG
+    return _probe_3dep_coverage_bbox(cx - h, cy - h, cx + h, cy + h,
+                                      probe_px=_1M_PROBE_PX, timeout=timeout)
+
+
+def probe_3dep_1m_coverage_grid(lat_floor: int, lng_floor: int,
+                                 grid_n: int, max_workers: int = 8,
+                                 probe_px: int = _1M_PROBE_PX,
+                                 timeout: int = 15):
+    """
+    Probe a grid_n x grid_n grid of cells spanning this 1-degree tile
+    for real 3DEP 1m coverage, one cheap small request per cell (run
+    in parallel). Used to decide, before a true-native-resolution
+    fetch, which fine sub-tiles are worth fetching at all -- 3DEP 1m
+    coverage is sparse (surveyed urban/project areas only), so most of
+    a given tile commonly has none, and there's no reason to spend a
+    full-size WCS request per fine sub-tile finding that out.
+
+    A coarse grid rather than probing every fine sub-tile individually
+    is a deliberate cost/precision tradeoff: real 1m coverage areas are
+    typically contiguous surveyed regions well larger than one coarse
+    cell at reasonable grid_n, so this rarely misses real coverage, and
+    keeps the probe pass itself cheap (grid_n=10 is 100 small requests,
+    a few seconds in parallel, vs. thousands for the real fetch this
+    guards). Raise grid_n for finer (but more expensive) precision.
+
+    Returns a grid_n x grid_n boolean numpy array, row 0 = southernmost
+    strip (matches the (row, col) convention used to build it -- NOT
+    raster row order).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    step = 1.0 / grid_n
+    coverage = np.zeros((grid_n, grid_n), dtype=bool)
+
+    def probe_cell(args):
+        row, col = args
+        cx = lng_floor + (col + 0.5) * step
+        cy = lat_floor + (row + 0.5) * step
+        h = min(_1M_PROBE_HALF_DEG, step / 4)
+        return row, col, _probe_3dep_coverage_bbox(
+            cx - h, cy - h, cx + h, cy + h,
+            probe_px=probe_px, timeout=timeout)
+
+    cells = [(row, col) for row in range(grid_n) for col in range(grid_n)]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(probe_cell, c) for c in cells]
+        for future in as_completed(futures):
+            row, col, has_coverage = future.result()
+            coverage[row, col] = has_coverage
+
+    n_covered = int(coverage.sum())
+    print(f"[3DEP-native] Coverage probe: {n_covered}/{grid_n*grid_n} "
+          f"coarse cells have real 1m data")
+    return coverage
+
+
+def download_tile_3dep_3m(lat, lng, output_dir):
+    """
+    Attempt the 3DEP ~3m tier for one 1-degree tile: probe for
     coverage cheaply, and if present, fetch the full tile via
     elevation.py's WCS sub-tile fetcher (already gap-filled from
     GLO-30 internally for any sub-tiles that fail, and grid-snapped
     onto an exact target shape/transform rather than trusting
-    merge()'s own inference) and resample it DOWN onto this
-    pipeline's canonical 10800x10800 grid using area averaging -- not
-    bilinear, which is right for upsampling GLO-30 but wrong for
-    downsampling 1m data (bilinear would just sample a few nearby
-    points instead of averaging the ~100 real 1m pixels each 10m cell
-    actually covers, throwing away most of the accuracy benefit of
-    fetching 1m data in the first place). 1m is a higher-fidelity
-    INPUT source here, not a new output resolution -- same pattern
-    this pipeline already uses for GLO-30, which is also always
-    normalized onto the 10m lattice, never left at native res.
+    merge()'s own inference), persist the raw fetch as a durable
+    sibling file (`{tile}_3m_native.tif` -- see build_hires_vrt.py,
+    which layers it over the 10m mosaic as a real-detail overlay), and
+    also resample it DOWN onto this pipeline's canonical 10800x10800
+    grid using area averaging for the standard mosaic -- not bilinear,
+    which is right for upsampling GLO-30 but wrong for downsampling
+    this data (bilinear would just sample a few nearby points instead
+    of averaging the ~100 real fine pixels each 10m cell actually
+    covers, throwing away most of the accuracy benefit of fetching it
+    in the first place).
 
-    Returns (Path, '1m') on success, None if there's no coverage or
+    This is NOT genuine 1m/px -- see download_tile_3dep_1m for that.
+    It requests the 3DEP 1m *product* via a sub-tile grid shaped for a
+    cheap 900-request fetch, which comes out to ~3m/px (see this
+    module's docstring for the full explanation).
+
+    Returns (Path, '3m') on success, None if there's no coverage or
     the fetch/resample failed for any reason -- callers fall through
     to the existing 10m/GLO-30 cascade unchanged.
     """
@@ -337,76 +487,165 @@ def download_tile_3dep_1m(lat, lng, output_dir):
 
     raw_dir = Path(output_dir) / 'raw'
     raw_dir.mkdir(parents=True, exist_ok=True)
-    out_path = raw_dir / f"{tile_label(lat, lng)}_1m.tif"
+    out_path = raw_dir / f"{tile_label(lat, lng)}_3m.tif"
+    native_path = raw_dir / f"{tile_label(lat, lng)}_3m_native.tif"
 
+    already_downsampled = False
     if out_path.exists() and out_path.stat().st_size > 10_000:
         if _raster_is_readable(out_path):
-            print(f"  [{tile_label(lat, lng)}] Cached (1m)")
-            return out_path, '1m'
-        out_path.unlink(missing_ok=True)
+            already_downsampled = True
+        else:
+            out_path.unlink(missing_ok=True)
+
+    native_ready = native_path.exists() and _raster_is_readable(native_path)
+
+    if already_downsampled and native_ready:
+        print(f"  [{tile_label(lat, lng)}] Cached (3m)")
+        return out_path, '3m'
 
     try:
         from elevation import _download_tile_3dep_subtiled
+    except Exception as e:
+        print(f"  [{tile_label(lat, lng)}] 3m unavailable "
+              f"(elevation.py import failed: {e})")
+        return None
+
+    try:
+        # grid_n/subtile_px must be passed explicitly -- the
+        # `resolution` kwarg below is only a print label inside
+        # _download_tile_3dep_subtiled; matches elevation.py's own
+        # download_tile_3dep(..., resolution=1) branch, which is the
+        # tested/correct source of these numbers.
+        raw_3m_path = _download_tile_3dep_subtiled(
+            lat_floor, lng_floor, resolution=1,
+            grid_n=_3M_GRID_N, subtile_px=_3M_SUBTILE_PX)
+    except Exception as e:
+        print(f"  [{tile_label(lat, lng)}] 3m fetch failed: {e}")
+        return None
+
+    try:
+        with rasterio.open(raw_3m_path) as src:
+            # _download_tile_3dep_subtiled falls back to a direct
+            # GLO-30 (30m) tile internally if every one of its own
+            # 900 sub-tile requests failed -- guard against silently
+            # "resampling" that under this label. A real fetch at this
+            # pipeline's sub-tile grid is 36000px wide (_3M_GRID_N *
+            # _3M_SUBTILE_PX); far below that means the fallback fired.
+            if src.width < _3M_DEGRADED_WIDTH_THRESHOLD_PX:
+                print(f"  [{tile_label(lat, lng)}] 3m fetch degraded "
+                      f"to a fallback resolution, skipping")
+                return None
+
+            if not native_ready:
+                shutil.copyfile(raw_3m_path, native_path)
+                if already_downsampled:
+                    print(f"  [{tile_label(lat, lng)}] Native kept at "
+                          f"{native_path.name} (mosaic tile already cached)")
+
+            if already_downsampled:
+                return out_path, '3m'
+
+        _resample_native_to_canonical_grid(raw_3m_path, lat_floor, lng_floor,
+                                            out_path)
+    except Exception as e:
+        print(f"  [{tile_label(lat, lng)}] 3m resample failed: {e}")
+        out_path.unlink(missing_ok=True)
+        return None
+
+    print(f"  [{tile_label(lat, lng)}] 3m source resampled to canonical "
+          f"10m grid ({out_path.stat().st_size / 1e6:.1f} MB), "
+          f"native kept at {native_path.name}")
+    return out_path, '3m'
+
+
+def download_tile_3dep_1m(lat, lng, output_dir):
+    """
+    Fetch a tile at TRUE native resolution (~1m/px, ~112000x112000px
+    for a 1-degree tile) -- not the ~3m/px download_tile_3dep_3m
+    settles for. Much more expensive: probes coverage on a coarse grid
+    first (probe_3dep_1m_coverage_grid) so sub-tiles in clearly
+    uncovered regions are skipped rather than fetched, then streams
+    the rest straight into the output file window-by-window
+    (elevation._download_tile_3dep_native) instead of assembling the
+    whole tile in memory -- required at this scale (~50GB as a single
+    array vs. one sub-tile, ~16MB, at a time).
+
+    Explicit opt-in only (resolution='1m') -- NOT part of --try-3m or
+    the 'best' cascade. Even with coverage-skipping, a tile with
+    substantial real coverage can still mean thousands of WCS requests
+    and tens of minutes.
+
+    Doesn't gap-fill sub-tiles that fail after retries -- unlike
+    download_tile_3dep_3m's underlying fetcher, which re-reads the
+    whole assembled array to patch gaps from GLO-30 (incompatible with
+    staying memory-bounded at this scale). Doesn't need to: this
+    raster is only ever consumed as a VRT overlay
+    (build_hires_vrt.py) on top of the always-complete standard
+    mosaic, and the VRT already treats overlay nodata as transparent
+    -- a failed sub-tile just shows the normal mosaic value through
+    the VRT instead of a hole, no separate gap-fill required. Only
+    someone opening this raw native file directly, bypassing the VRT,
+    would ever see a real nodata gap from a failed request.
+
+    Returns (Path, '1m') on success, None if there's no coverage at
+    all or the fetch failed.
+    """
+    lat_floor, lng_floor = math.floor(lat), math.floor(lng)
+
+    if lng_floor >= 0 or lat_floor < 24 or lat_floor > 72:
+        return None
+
+    if not _probe_3dep_1m_coverage(lat_floor, lng_floor):
+        return None
+
+    raw_dir = Path(output_dir) / 'raw'
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    out_path = raw_dir / f"{tile_label(lat, lng)}_1m.tif"
+    native_path = raw_dir / f"{tile_label(lat, lng)}_1m_native.tif"
+
+    if (out_path.exists() and out_path.stat().st_size > 10_000
+            and _raster_is_readable(out_path)
+            and native_path.exists() and _raster_is_readable(native_path)):
+        print(f"  [{tile_label(lat, lng)}] Cached (1m)")
+        return out_path, '1m'
+
+    try:
+        from elevation import (_download_tile_3dep_native,
+                                NATIVE_1M_GRID_N, NATIVE_1M_SUBTILE_PX,
+                                NATIVE_1M_PROBE_GRID_N)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 1m unavailable "
               f"(elevation.py import failed: {e})")
         return None
 
     try:
-        raw_1m_path = _download_tile_3dep_subtiled(
-            lat_floor, lng_floor, resolution=1)
+        coverage = probe_3dep_1m_coverage_grid(
+            lat_floor, lng_floor, grid_n=NATIVE_1M_PROBE_GRID_N)
+        if not coverage.any():
+            print(f"  [{tile_label(lat, lng)}] No coverage found on the "
+                  f"coarse probe grid, skipping")
+            return None
+
+        _download_tile_3dep_native(
+            lat_floor, lng_floor, native_path,
+            coverage_grid=(NATIVE_1M_PROBE_GRID_N, coverage),
+            grid_n=NATIVE_1M_GRID_N, subtile_px=NATIVE_1M_SUBTILE_PX)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 1m fetch failed: {e}")
         return None
 
     try:
-        with rasterio.open(raw_1m_path) as src:
-            # _download_tile_3dep_subtiled falls back to a direct
-            # GLO-30 (30m) tile internally if every one of its own
-            # 81 sub-tile requests failed -- guard against silently
-            # "resampling" that under the 1m label. A real 1m tile at
-            # this pipeline's sub-tile grid is ~108000px wide;
-            # anything far below that means the fallback fired.
-            if src.width < _1M_DEGRADED_WIDTH_THRESHOLD_PX:
-                print(f"  [{tile_label(lat, lng)}] 1m fetch degraded "
-                      f"to a fallback resolution, skipping")
-                return None
-
-            w, s, e, n = lng_floor, lat_floor, lng_floor + 1, lat_floor + 1
-            grid_px = _1M_CANONICAL_GRID_PX
-            dst_transform = rasterio.transform.from_bounds(
-                w, s, e, n, grid_px, grid_px)
-            dst_data = np.full((grid_px, grid_px), src.nodata
-                                if src.nodata is not None else -9999.0,
-                                dtype=np.float32)
-            rasterio.warp.reproject(
-                source=rasterio.band(src, 1),
-                destination=dst_data,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_transform,
-                dst_crs=CRS.from_epsg(4326),
-                src_nodata=src.nodata,
-                dst_nodata=src.nodata if src.nodata is not None else -9999.0,
-                resampling=Resampling.average,
-            )
-
-            profile = {
-                'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
-                'width': grid_px, 'height': grid_px,
-                'crs': 'EPSG:4326', 'transform': dst_transform,
-                'compress': 'deflate', 'BIGTIFF': 'YES',
-                'nodata': src.nodata if src.nodata is not None else -9999.0,
-            }
-            with rasterio.open(out_path, 'w', **profile) as dst:
-                dst.write(dst_data, 1)
+        _resample_native_to_canonical_grid(native_path, lat_floor, lng_floor,
+                                            out_path)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 1m resample failed: {e}")
         out_path.unlink(missing_ok=True)
         return None
 
-    print(f"  [{tile_label(lat, lng)}] 1m source resampled to canonical "
-          f"10m grid ({out_path.stat().st_size / 1e6:.1f} MB)")
+    print(f"  [{tile_label(lat, lng)}] 1m resampled to canonical "
+          f"10m grid ({out_path.stat().st_size / 1e6:.1f} MB), "
+          f"native kept at {native_path.name} "
+          f"({native_path.stat().st_size / 1e6:.1f} MB)")
     return out_path, '1m'
 
 
@@ -556,34 +795,54 @@ def _raster_is_readable(path) -> bool:
         return False
 
 
-def download_tile(lat, lng, output_dir, resolution='best', try_1m=False,
+def download_tile(lat, lng, output_dir, resolution='best', try_3m=False,
                   timeout=120, chunk_mb=1, max_download_s=DEFAULT_MAX_DOWNLOAD_S):
     """
     Download one 1-degree DEM tile at the best available resolution.
     Returns (Path, res_label) on success, None on failure.
     Skips download if file already exists and is valid.
 
-    try_1m: 'best' (the default cascade) does NOT attempt the 1m
-    tier unless this is True. The raw 1m fetch is expensive to store
-    even though the final tile lands at the same 10m-equivalent size
-    as everything else, and every tile build would otherwise pay for
-    an 81-request WCS fetch (even a coverage-miss probe still costs a
-    request) in areas that mostly don't have 1m coverage at all. Opt
-    in explicitly (this flag, or resolution='1m') for a run where the
+    try_3m: 'best' (the default cascade) does NOT attempt the ~3m
+    tier unless this is True. The raw fetch is expensive to store
+    even though the mosaic tile itself lands at the same 10m-equivalent
+    size as everything else, and every tile build would otherwise pay
+    for a 900-request WCS fetch (even a coverage-miss probe still costs
+    a request) in areas that mostly don't have 1m coverage at all. Opt
+    in explicitly (this flag, or resolution='3m') for a run where the
     accuracy is worth the cost, rather than making it the default.
+    Whenever this succeeds, the native ~3m raster is also kept (see
+    download_tile_3dep_3m) so build_hires_vrt.py can layer it over the
+    final mosaic -- download_study_area() does this automatically.
     """
-    # 1m tier: not a simple direct-URL candidate like the others (WCS
-    # sub-tile fetch, not one GET), so it's tried as a pre-step rather
-    # than folded into get_candidates()'s list. An explicit '1m'
-    # request does NOT fall through to 10m/GLO-30 on failure, matching
-    # how explicit '10m'/'30m' already behave (no silent substitution
-    # under a mismatched label).
-    if resolution == '1m' or (resolution == 'best' and try_1m):
+    # 3m/1m tiers: not simple direct-URL candidates like the others
+    # (WCS sub-tile fetch, not one GET), so they're tried as a
+    # pre-step rather than folded into get_candidates()'s list.
+    #
+    # resolution='3m' is explicit-only with no fallback -- matches how
+    # explicit '10m'/'30m' already behave (no silent substitution
+    # under a mismatched label). It's also never tried under 'best'
+    # just from try_3m being set for a run -- try_3m only applies
+    # per-tile, same as this whole block.
+    if resolution == '3m' or (resolution == 'best' and try_3m):
+        result = download_tile_3dep_3m(lat, lng, output_dir)
+        if result is not None:
+            return result
+        if resolution == '3m':
+            return None
+
+    # resolution='1m' DOES fall through to the normal 10m/GLO-30
+    # cascade below when a given tile has no genuine 1m coverage --
+    # unlike '3m'/'10m'/'30m', the point of requesting '1m' for a
+    # whole study area is real detail where it exists, not an
+    # all-or-nothing demand that leaves gaps in the rest of the area.
+    # It never falls through to the 3m tier either way -- that tier is
+    # a fetch-shape workaround this project's own engineering limits
+    # forced on the ~3m tier, not something '1m' requests should ever
+    # pay for on the way to its own, unrelated fallback.
+    if resolution == '1m':
         result = download_tile_3dep_1m(lat, lng, output_dir)
         if result is not None:
             return result
-        if resolution == '1m':
-            return None
 
     candidates = get_candidates(lat, lng, resolution)
     if not candidates:
@@ -783,7 +1042,7 @@ def mosaic_tiles(tile_paths, output_path, bounds):
 # ─────────────────────────────────────────────
 
 def download_study_area(area, dry_run=False, resume=True,
-                        max_workers=4, no_mosaic=False, try_1m=False):
+                        max_workers=4, no_mosaic=False, try_3m=False):
     tiles = get_1deg_tiles(area.south, area.west, area.north, area.east)
 
     print(f"\n{'='*62}")
@@ -819,7 +1078,7 @@ def download_study_area(area, dry_run=False, resume=True,
         futures = {
             executor.submit(
                 download_tile, lat, lng, area.output_dir,
-                resolution=area.resolution, try_1m=try_1m,
+                resolution=area.resolution, try_3m=try_3m,
             ): (lat, lng)
             for lat, lng in tiles
         }
@@ -862,6 +1121,28 @@ def download_study_area(area, dry_run=False, resume=True,
     mosaic_path = Path(area.output_dir) / f"{area.name}_mosaic.tif"
     mosaic_tiles(downloaded, str(mosaic_path), area.bounds)
 
+    if try_3m or area.resolution in ('3m', '1m'):
+        # The two tiers write to different native filenames -- match
+        # whichever one was actually requested for this area, not both
+        # (a run using --try-3m never touches the 1m tier and vice
+        # versa, so checking the other suffix would find nothing).
+        native_suffix = '1m_native.tif' if area.resolution == '1m' else '3m_native.tif'
+        raw_dir = Path(area.output_dir) / 'raw'
+        native_paths = [
+            raw_dir / f"{tile_label(lat, lng)}_{native_suffix}"
+            for lat, lng in tiles
+        ]
+        native_paths = [p for p in native_paths if p.exists()]
+        if not native_paths:
+            print("[HIRES-VRT] No tiles got real high-resolution coverage -- skipping")
+        elif not mosaic_path.exists():
+            print("[HIRES-VRT] Mosaic was not written -- skipping")
+        else:
+            vrt_path = Path(area.output_dir) / f"{area.name}_mosaic_hires.vrt"
+            build_hires_vrt(mosaic_path, native_paths, vrt_path)
+            print(f"[HIRES-VRT] {len(native_paths)} native tile(s) layered "
+                  f"onto the mosaic -> {vrt_path}")
+
 
 # ─────────────────────────────────────────────
 # CLI
@@ -886,12 +1167,24 @@ def main():
     parser.add_argument('--allow-large', action='store_true',
         help=f'Bypass the {MAX_MOSAIC_TILES}-degree-tile size cap on corner1/corner2 areas')
     parser.add_argument('--resolution', default='best',
-        choices=['best', '1m', '10m', '30m'])
-    parser.add_argument('--try-1m', action='store_true',
-        help="Also attempt the 1m tier under --resolution best "
-             "(off by default -- 1m coverage is sparse and the raw "
-             "fetch is expensive to store even though the final tile "
-             "lands at the same size as everything else)")
+        choices=['best', '3m', '1m', '10m', '30m'],
+        help="'3m' is ~3m/px (900 WCS requests/tile), explicit-only, "
+             "no fallback if a tile has no coverage (like '10m'/'30m'). "
+             "'1m' is genuine ~1m/px (up to ~3100 requests/tile, tens "
+             "of minutes even with coverage-skipping); a tile with no "
+             "1m coverage falls back to the normal 10m/GLO-30 cascade "
+             "so the area mosaic stays complete -- it never falls back "
+             "to '3m' though. Neither tier is ever tried under 'best' "
+             "or --try-3m without an explicit --resolution request.")
+    parser.add_argument('--try-3m', action='store_true',
+        help="Also attempt the ~3m tier under --resolution best "
+             "(off by default -- coverage is sparse and the raw "
+             "fetch is expensive: 900 WCS requests per tile). For any "
+             "tile that gets real coverage, the native raster is "
+             "kept and layered over the final mosaic as a "
+             "<name>_mosaic_hires.vrt -- real fine detail where it was "
+             "fetched, the normal 10m mosaic everywhere else. Use "
+             "--resolution 1m instead for genuine ~1m/px.")
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--workers', type=int, default=4,
         help='Parallel download threads (default: 4)')
@@ -928,7 +1221,7 @@ def main():
         resume=not args.no_resume,
         max_workers=args.workers,
         no_mosaic=args.no_mosaic,
-        try_1m=args.try_1m,
+        try_3m=args.try_3m,
     )
 
 
