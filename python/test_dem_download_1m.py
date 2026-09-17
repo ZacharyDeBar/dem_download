@@ -124,10 +124,16 @@ def test_native_fetch_leaves_nodata_on_failed_subtile():
         # Every fetch "fails" (server error / timeout) -- output
         # should still be a valid, fully-nodata raster, not a crash.
         with patch('elevation._fetch_wcs_geotiff_bytes', return_value=None):
-            elevation._download_tile_3dep_native(
-                lat_floor, lng_floor, out_path,
-                coverage_grid=None,  # fetch everything
-                grid_n=grid_n, subtile_px=subtile_px, max_workers=2)
+            result_path, n_fetched, n_failed, n_skipped = (
+                elevation._download_tile_3dep_native(
+                    lat_floor, lng_floor, out_path,
+                    coverage_grid=None,  # fetch everything
+                    grid_n=grid_n, subtile_px=subtile_px, max_workers=2))
+
+        assert result_path == out_path
+        assert n_fetched == 0
+        assert n_failed == grid_n * grid_n
+        assert n_skipped == 0
 
         with rasterio.open(out_path) as ds:
             data = ds.read(1)
@@ -185,7 +191,7 @@ def test_native_1m_happy_path_downsamples_and_persists_native():
         def fake_native_fetch(lat_floor, lng_floor, out_path, **kwargs):
             with rasterio.open(out_path, 'w', **profile) as dst:
                 dst.write(arr, 1)
-            return out_path
+            return out_path, src_px * src_px, 0, 0  # all sub-tiles "fetched"
 
         canonical_px = 60
         with patch('dem_download._probe_3dep_1m_coverage', return_value=True), \
@@ -213,6 +219,88 @@ def test_native_1m_happy_path_downsamples_and_persists_native():
     print('  test_native_1m_happy_path_downsamples_and_persists_native OK')
 
 
+def test_native_1m_falls_back_when_fetch_finds_no_usable_data():
+    # Regression test: the coarse probe finds real coverage, but the
+    # full-resolution fetch fails on every sub-tile it attempts (e.g.
+    # a WCS outage partway through). download_tile_3dep_1m must NOT
+    # treat this as a successful '1m' tile -- an all-nodata native
+    # raster resampled onto the canonical grid would silently punch a
+    # hole in the study-area mosaic instead of falling back.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch('dem_download._probe_3dep_1m_coverage', return_value=True), \
+             patch('dem_download.probe_3dep_1m_coverage_grid',
+                   return_value=np.ones((10, 10), dtype=bool)), \
+             patch('elevation._download_tile_3dep_native',
+                   return_value=(None, 0, 25, 0)):
+            result = dem_download.download_tile_3dep_1m(45, -110, tmpdir)
+
+        assert result is None
+        native_path = (Path(tmpdir) / 'raw' /
+                        f"{dem_download.tile_label(45, -110)}_1m_native.tif")
+        assert not native_path.exists()
+    print('  test_native_1m_falls_back_when_fetch_finds_no_usable_data OK')
+
+
+def test_native_1m_cache_survives_native_backfill_failure():
+    # Regression test: out_path (the mosaic tile) is already valid but
+    # native_path (the VRT-overlay bonus file) is missing. If the
+    # backfill attempt then fails (probe outage), the already-good
+    # cached tile must still be returned, not discarded as None.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_dir = Path(tmpdir) / 'raw'
+        raw_dir.mkdir()
+        out_path = raw_dir / f"{dem_download.tile_label(45, -110)}_1m.tif"
+        px = 100
+        arr = np.full((px, px), 1234.0, dtype=np.float32)
+        transform = from_bounds(-110, 45, -109, 46, px, px)
+        profile = {
+            'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+            'width': px, 'height': px, 'crs': 'EPSG:4326',
+            'transform': transform, 'nodata': -9999.0,
+        }
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(arr, 1)
+
+        with patch('dem_download._probe_3dep_1m_coverage', return_value=False):
+            result = dem_download.download_tile_3dep_1m(45, -110, tmpdir)
+
+        assert result == (out_path, '1m')
+        assert out_path.exists()
+    print('  test_native_1m_cache_survives_native_backfill_failure OK')
+
+
+def test_native_1m_resamples_directly_from_cached_native_without_refetch():
+    # Regression test: native_path is already fetched and valid but
+    # out_path is missing (e.g. killed between fetch and resample on a
+    # prior run). Must resample straight from the cached native file
+    # rather than re-running the full, expensive WCS fetch.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_dir = Path(tmpdir) / 'raw'
+        raw_dir.mkdir()
+        native_path = raw_dir / f"{dem_download.tile_label(45, -110)}_1m_native.tif"
+        src_px = 40
+        arr = np.full((src_px, src_px), 1500.0, dtype=np.float32)
+        transform = from_bounds(-110, 45, -109, 46, src_px, src_px)
+        profile = {
+            'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+            'width': src_px, 'height': src_px, 'crs': 'EPSG:4326',
+            'transform': transform, 'nodata': -9999.0,
+        }
+        with rasterio.open(native_path, 'w', **profile) as dst:
+            dst.write(arr, 1)
+
+        with patch('dem_download._probe_3dep_1m_coverage') as mock_probe, \
+             patch('elevation._download_tile_3dep_native') as mock_fetch:
+            result = dem_download.download_tile_3dep_1m(45, -110, tmpdir)
+
+        out_path, label = result
+        assert label == '1m'
+        assert out_path.exists()
+        mock_probe.assert_not_called()
+        mock_fetch.assert_not_called()
+    print('  test_native_1m_resamples_directly_from_cached_native_without_refetch OK')
+
+
 def test_native_1m_cached_output_short_circuits_refetch():
     # Deliberately writes the cache fixtures directly (uncompressed,
     # matching test_dem_download_3m.py's own cache-hit test) rather
@@ -237,15 +325,15 @@ def test_native_1m_cached_output_short_circuits_refetch():
             with rasterio.open(p, 'w', **profile) as dst:
                 dst.write(arr, 1)
 
-        # The cheap whole-tile probe still runs even on a cache hit
-        # (same established pattern as download_tile_3dep_3m) -- what
-        # must be skipped is the expensive coarse-grid probe and the
-        # full windowed fetch.
-        with patch('dem_download._probe_3dep_1m_coverage', return_value=True), \
+        # A full cache hit (both files present and valid) short-circuits
+        # before any network call at all, including the cheap whole-tile
+        # probe -- not just the expensive coarse-grid probe and fetch.
+        with patch('dem_download._probe_3dep_1m_coverage') as mock_probe, \
              patch('dem_download.probe_3dep_1m_coverage_grid') as mock_grid, \
              patch('elevation._download_tile_3dep_native') as mock_fetch:
             result = dem_download.download_tile_3dep_1m(45, -110, tmpdir)
             assert result == (out_path, '1m')
+            mock_probe.assert_not_called()
             mock_grid.assert_not_called()
             mock_fetch.assert_not_called()
     print('  test_native_1m_cached_output_short_circuits_refetch OK')
@@ -318,6 +406,9 @@ if __name__ == '__main__':
     test_native_1m_skips_probe_outside_us_bounds()
     test_native_1m_returns_none_when_no_coverage_at_all()
     test_native_1m_happy_path_downsamples_and_persists_native()
+    test_native_1m_falls_back_when_fetch_finds_no_usable_data()
+    test_native_1m_cache_survives_native_backfill_failure()
+    test_native_1m_resamples_directly_from_cached_native_without_refetch()
     test_native_1m_cached_output_short_circuits_refetch()
     test_download_tile_dispatches_native_1m_explicitly()
     test_1m_falls_back_to_10m_30m_cascade_when_no_coverage()

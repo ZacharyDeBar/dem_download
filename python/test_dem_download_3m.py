@@ -312,6 +312,69 @@ def test_cached_output_short_circuits_refetch():
     print('  test_cached_output_short_circuits_refetch OK')
 
 
+def test_cache_survives_native_backfill_failure():
+    # Regression test: out_path (the mosaic tile) is already valid but
+    # native_path (the VRT-overlay bonus file) is missing. If the
+    # backfill attempt then fails (probe outage, degraded fetch, etc.),
+    # the already-good cached tile must still be returned, not
+    # discarded as None.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_dir = Path(tmpdir) / 'raw'
+        raw_dir.mkdir()
+        out_path = raw_dir / f"{dem_download.tile_label(45, -110)}_3m.tif"
+        px = 100
+        arr = np.full((px, px), 1234.0, dtype=np.float32)
+        transform = from_bounds(-110, 45, -109, 46, px, px)
+        profile = {
+            'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+            'width': px, 'height': px, 'crs': 'EPSG:4326',
+            'transform': transform, 'nodata': -9999.0,
+        }
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(arr, 1)
+
+        with patch('dem_download._probe_3dep_1m_coverage', return_value=False):
+            result = dem_download.download_tile_3dep_3m(45, -110, tmpdir)
+
+        assert result == (out_path, '3m')
+        assert out_path.exists()
+    print('  test_cache_survives_native_backfill_failure OK')
+
+
+def test_resamples_directly_from_cached_native_without_refetch():
+    # Regression test: native_path is already fetched and valid but
+    # out_path is missing (e.g. killed between fetch and resample on a
+    # prior run). Must resample straight from the cached native file
+    # rather than re-running the full 900-request fetch.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_dir = Path(tmpdir) / 'raw'
+        raw_dir.mkdir()
+        native_path = raw_dir / f"{dem_download.tile_label(45, -110)}_3m_native.tif"
+        src_px = 60
+        arr = np.full((src_px, src_px), 1500.0, dtype=np.float32)
+        transform = from_bounds(-110, 45, -109, 46, src_px, src_px)
+        profile = {
+            'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+            'width': src_px, 'height': src_px, 'crs': 'EPSG:4326',
+            'transform': transform, 'nodata': -9999.0,
+        }
+        with rasterio.open(native_path, 'w', **profile) as dst:
+            dst.write(arr, 1)
+
+        with patch('dem_download._probe_3dep_1m_coverage') as mock_probe, \
+             patch('elevation._download_tile_3dep_subtiled') as mock_fetch:
+            result = dem_download.download_tile_3dep_3m(45, -110, tmpdir)
+
+        out_path, label = result
+        assert label == '3m'
+        assert out_path.exists()
+        mock_probe.assert_not_called()
+        mock_fetch.assert_not_called()
+    print('  test_resamples_directly_from_cached_native_without_refetch OK')
+
+
 # ── download_tile()'s opt-in gating ─────────────────────────────────
 
 def test_best_resolution_does_not_try_3m_by_default():
@@ -363,6 +426,8 @@ if __name__ == '__main__':
     test_subtiled_fetch_uses_correct_grid_params()
     test_native_raster_always_persisted()
     test_cached_output_short_circuits_refetch()
+    test_cache_survives_native_backfill_failure()
+    test_resamples_directly_from_cached_native_without_refetch()
     test_best_resolution_does_not_try_3m_by_default()
     test_best_resolution_tries_3m_when_opted_in()
     test_explicit_3m_resolution_tries_it_regardless_of_try_3m_flag()

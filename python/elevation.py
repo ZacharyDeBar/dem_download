@@ -422,7 +422,11 @@ def _download_tile_3dep_subtiled(
         ds.close()
     for mf in open_memfiles:
         mf.close()
-    del mosaic
+    # mosaic was rebound to snapped above (`mosaic, transform = snapped,
+    # target_transform`) -- both names reference the same array, so
+    # `del mosaic` alone leaves it alive via the `snapped` name for the
+    # rest of the function, through both gap-fill passes below.
+    del mosaic, snapped
 
     # ── Gap fill from GLO30 ───────────────────────────────────────
     if len(results) < len(subtiles):
@@ -461,6 +465,7 @@ def _download_tile_3dep_subtiled(
             dep_profile.update({'nodata': dep_nodata, 'BIGTIFF': 'YES'})
             with rasterio.open(local_path, 'w', **dep_profile) as dst:
                 dst.write(dep_data, 1)
+            del dep_data, glo_resampled, gap_mask
 
             print(f"[3DEP] Gap filled {filled_count:,} pixels from GLO30")
         except Exception as e:
@@ -506,10 +511,12 @@ def _download_tile_3dep_subtiled(
 
             with rasterio.open(local_path, 'w', **dep_profile) as dst:
                 dst.write(dep_data, 1)
+            del glo_resampled
 
             print(f"[3DEP] Filled {n_gaps:,} pixels from GLO30")
         else:
             print(f"[3DEP] No nodata gaps found")
+        del dep_data, gap_mask
 
     except Exception as e:
         print(f"[3DEP] Gap fill warning: {e}")
@@ -589,9 +596,12 @@ def _download_tile_3dep_native(
     the VRT instead of a hole. A sub-tile that fails after retries is
     simply left as nodata here.
 
-    Returns out_path. Raises if the WCS response for a covered
-    sub-tile can't be decoded as a raster (distinct from a plain fetch
-    failure, which just leaves that window as nodata).
+    Returns (out_path, n_fetched, n_failed, n_skipped) -- the caller
+    needs the counts to tell "real data landed in out_path" apart from
+    "every covered sub-tile failed and out_path is all nodata" (both
+    otherwise look like a normal return). Raises if the WCS response
+    for a covered sub-tile can't be decoded as a raster (distinct from
+    a plain fetch failure, which just leaves that window as nodata).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from rasterio.transform import from_bounds
@@ -721,7 +731,163 @@ def _download_tile_3dep_native(
     print(f"[3DEP-native] Done: {n_fetched} fetched, {n_failed} failed "
           f"(left nodata), {n_skipped} skipped -- {out_path.name} "
           f"({out_path.stat().st_size/1e6:.1f}MB)")
-    return out_path
+    return out_path, n_fetched, n_failed, n_skipped
+
+
+# ─────────────────────────────────────────────
+# Direct narrow-AOI fetch (no whole-degree tiling)
+# ─────────────────────────────────────────────
+# download_tile_3dep_1m/_3m (dem_download.py) always probe and fetch an
+# entire 1-degree tile, then let the caller crop down to the actual
+# area of interest -- fine for a study-area mosaic spanning many
+# tiles, wasteful for an AOI that's a few acres to a couple km across
+# (a coverage probe plus, at 1m, up to ~3100 sub-tile requests for
+# data that's immediately thrown away). The WCS endpoint already
+# accepts an arbitrary BBOX/WIDTH/HEIGHT -- this instead requests
+# exactly the caller's bounds, in as few requests as the server's own
+# per-request pixel ceiling allows.
+
+_WCS_MAX_REQUEST_PX = NATIVE_1M_SUBTILE_PX  # same empirically-confirmed
+                                              # server-side ceiling as
+                                              # the comment above
+                                              # NATIVE_1M_SUBTILE_PX
+                                              # describes -- it's a WCS
+                                              # server limit, not
+                                              # specific to the 1m tier.
+
+
+def fetch_dem_direct(
+    south: float, west: float, north: float, east: float,
+    resolution_m: float, out_path: Path,
+    max_workers: int = 6, timeout: int = 60,
+) -> "tuple | None":
+    """
+    Fetch 3DEP elevation for an arbitrary, non-tile-aligned bounding
+    box at resolution_m meters/pixel, writing directly to out_path.
+
+    Unlike download_tile_3dep_1m/_3m, this requests exactly
+    [south, west, north, east] and nothing more. For a small AOI that
+    fits within one WCS request at the target resolution (~2000px
+    square, e.g. up to ~2km across at 1m/px), this is a single
+    request -- no coverage probe, no sub-tile grid, no merge. Larger
+    AOIs fall back to gridding, but only over the requested area
+    (never a whole degree), writing each cell directly into its
+    output window as it arrives so memory stays bounded to one cell
+    regardless of AOI size (same technique _download_tile_3dep_native
+    uses for the same reason).
+
+    Returns (out_path, n_fetched, n_failed), or None if every request
+    came back with no usable data (area outside 3DEP coverage).
+    """
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject
+    from rasterio.enums import Resampling
+    from rasterio.windows import Window
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if east <= west or north <= south:
+        raise ValueError(f"Invalid bounds: south={south} west={west} "
+                          f"north={north} east={east}")
+
+    width_px  = max(1, round((east - west) * _METERS_PER_DEGREE_LAT
+                              / resolution_m))
+    height_px = max(1, round((north - south) * _METERS_PER_DEGREE_LAT
+                              / resolution_m))
+
+    nodata = -9999.0
+    out_transform = from_bounds(west, south, east, north, width_px, height_px)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base_url = (
+        "https://elevation.nationalmap.gov/arcgis/services/"
+        "3DEPElevation/ImageServer/WCSServer"
+        "?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage"
+        "&COVERAGE=DEP3Elevation&CRS=EPSG:4326&FORMAT=GeoTIFF"
+    )
+
+    def fetch_cell(cell_south, cell_west, cell_north, cell_east, window):
+        url = (base_url +
+               f"&BBOX={cell_west},{cell_south},{cell_east},{cell_north}"
+               f"&WIDTH={window.width}&HEIGHT={window.height}")
+        data = _fetch_wcs_geotiff_bytes(url, timeout=timeout,
+                                         label=f"({window.col_off},{window.row_off})")
+        return window, data
+
+    def write_cell(dst, window, data):
+        arr = np.full((window.height, window.width), nodata, dtype=np.float32)
+        if data is not None:
+            with rasterio.io.MemoryFile(data) as mf, mf.open() as src:
+                src_nodata = src.nodata if src.nodata is not None else nodata
+                reproject(
+                    source=rasterio.band(src, 1), destination=arr,
+                    src_transform=src.transform, src_crs=src.crs,
+                    dst_transform=dst.window_transform(window),
+                    dst_crs='EPSG:4326',
+                    src_nodata=src_nodata, dst_nodata=nodata,
+                    resampling=Resampling.nearest,
+                )
+        dst.write(arr, 1, window=window)
+        return data is not None and bool((arr > nodata + 1).any())
+
+    profile = {
+        'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+        'width': width_px, 'height': height_px, 'crs': 'EPSG:4326',
+        'transform': out_transform, 'nodata': nodata,
+        'compress': 'deflate', 'predictor': 2, 'tiled': True,
+        'blockxsize': 512, 'blockysize': 512,
+    }
+
+    if width_px <= _WCS_MAX_REQUEST_PX and height_px <= _WCS_MAX_REQUEST_PX:
+        print(f"[3DEP-direct] {width_px}x{height_px}px fits in a single "
+              f"request -- fetching directly...")
+        window = Window(0, 0, width_px, height_px)
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            _, data = fetch_cell(south, west, north, east, window)
+            got_data = write_cell(dst, window, data)
+        n_fetched, n_failed = (1, 0) if got_data else (0, 1)
+    else:
+        grid_cols = math.ceil(width_px  / _WCS_MAX_REQUEST_PX)
+        grid_rows = math.ceil(height_px / _WCS_MAX_REQUEST_PX)
+        print(f"[3DEP-direct] {width_px}x{height_px}px needs a "
+              f"{grid_cols}x{grid_rows} grid of requests...")
+
+        windows = []
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                px0 = col * _WCS_MAX_REQUEST_PX
+                py0 = row * _WCS_MAX_REQUEST_PX
+                w = min(_WCS_MAX_REQUEST_PX, width_px  - px0)
+                h = min(_WCS_MAX_REQUEST_PX, height_px - py0)
+                windows.append(Window(px0, py0, w, h))
+
+        n_fetched = n_failed = 0
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            def cell_bounds(window):
+                cw, cn = out_transform * (window.col_off, window.row_off)
+                ce, cs = out_transform * (window.col_off + window.width,
+                                           window.row_off + window.height)
+                return cs, cw, cn, ce
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(fetch_cell, *cell_bounds(w), w): w
+                           for w in windows}
+                for future in as_completed(futures):
+                    window, data = future.result()
+                    if write_cell(dst, window, data):
+                        n_fetched += 1
+                    else:
+                        n_failed += 1
+
+    if n_fetched == 0:
+        print("[3DEP-direct] No usable data returned -- area may be "
+              "outside 3DEP coverage")
+        out_path.unlink(missing_ok=True)
+        return None
+
+    print(f"[3DEP-direct] Done: {n_fetched} fetched, {n_failed} failed -- "
+          f"{out_path.name} ({out_path.stat().st_size/1e6:.2f}MB)")
+    return out_path, n_fetched, n_failed
 
 
 def download_tile_3dep(lat: float, lng: float, resolution: int = 10) -> Path:

@@ -422,6 +422,12 @@ def repair_dem(
         glo30_transform=glo30_transform,
         verbose=verbose,
     )
+    # Original DEM data and the GLO-30 mosaic are both full-study-area
+    # float32 arrays and aren't needed again (step 6 re-reads gaps from
+    # the written file rather than reusing these) -- drop them now
+    # rather than letting them sit alive alongside `repaired` through
+    # the write below.
+    del gap_info['data'], gap_info['gap_mask'], glo30_data
 
     # ── Step 5: Write repaired DEM ────────────────────────────────
     print(f"\n[STEP 5] Writing repaired DEM to {dem_path}...")
@@ -443,7 +449,11 @@ def repair_dem(
     })
 
     with rasterio.open(dem_path, 'w', **profile) as dst:
-        dst.write(repaired.astype(np.float32), 1)
+        # repaired is already float32 (fill_gaps derives it from
+        # dem_data.copy(), itself cast in detect_gaps) -- .astype()
+        # would silently make another full-size copy since it copies
+        # by default even when the dtype already matches.
+        dst.write(repaired, 1)
 
     written_mb = Path(dem_path).stat().st_size / 1e6
     print(f"  Written: {dem_path} ({written_mb:.0f}MB)")

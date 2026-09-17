@@ -482,9 +482,6 @@ def download_tile_3dep_3m(lat, lng, output_dir):
     if lng_floor >= 0 or lat_floor < 24 or lat_floor > 72:
         return None
 
-    if not _probe_3dep_1m_coverage(lat_floor, lng_floor):
-        return None
-
     raw_dir = Path(output_dir) / 'raw'
     raw_dir.mkdir(parents=True, exist_ok=True)
     out_path = raw_dir / f"{tile_label(lat, lng)}_3m.tif"
@@ -499,16 +496,44 @@ def download_tile_3dep_3m(lat, lng, output_dir):
 
     native_ready = native_path.exists() and _raster_is_readable(native_path)
 
+    # Full cache hit -- short-circuit before any network call, and
+    # before the coverage probe below, which would otherwise discard
+    # an already-valid mosaic tile on a transient probe failure.
     if already_downsampled and native_ready:
         print(f"  [{tile_label(lat, lng)}] Cached (3m)")
         return out_path, '3m'
+
+    # Native raster already fetched, only the resampled mosaic tile is
+    # missing (e.g. killed between the two steps on a prior run) --
+    # resample straight from the cached native file rather than
+    # re-running the full 900-request fetch to reproduce data already
+    # on disk.
+    if native_ready and not already_downsampled:
+        try:
+            _resample_native_to_canonical_grid(native_path, lat_floor,
+                                                lng_floor, out_path)
+            print(f"  [{tile_label(lat, lng)}] Resampled cached native "
+                  f"(3m) to canonical grid")
+            return out_path, '3m'
+        except Exception as e:
+            print(f"  [{tile_label(lat, lng)}] Resample of cached native "
+                  f"failed ({e}) -- refetching")
+
+    # Below this point, a fetch/probe failure only costs the (still
+    # missing) native overlay backfill if a valid mosaic tile already
+    # exists -- return that cached tile instead of None so a transient
+    # failure never discards previously-good output.
+    cached_fallback = (out_path, '3m') if already_downsampled else None
+
+    if not _probe_3dep_1m_coverage(lat_floor, lng_floor):
+        return cached_fallback
 
     try:
         from elevation import _download_tile_3dep_subtiled
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 3m unavailable "
               f"(elevation.py import failed: {e})")
-        return None
+        return cached_fallback
 
     try:
         # grid_n/subtile_px must be passed explicitly -- the
@@ -521,7 +546,7 @@ def download_tile_3dep_3m(lat, lng, output_dir):
             grid_n=_3M_GRID_N, subtile_px=_3M_SUBTILE_PX)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 3m fetch failed: {e}")
-        return None
+        return cached_fallback
 
     try:
         with rasterio.open(raw_3m_path) as src:
@@ -534,7 +559,7 @@ def download_tile_3dep_3m(lat, lng, output_dir):
             if src.width < _3M_DEGRADED_WIDTH_THRESHOLD_PX:
                 print(f"  [{tile_label(lat, lng)}] 3m fetch degraded "
                       f"to a fallback resolution, skipping")
-                return None
+                return cached_fallback
 
             if not native_ready:
                 shutil.copyfile(raw_3m_path, native_path)
@@ -549,6 +574,11 @@ def download_tile_3dep_3m(lat, lng, output_dir):
                                             out_path)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 3m resample failed: {e}")
+        if already_downsampled:
+            # out_path predates this backfill attempt -- a failure
+            # here only means the native overlay didn't get backfilled,
+            # not that the cached mosaic tile is bad.
+            return out_path, '3m'
         out_path.unlink(missing_ok=True)
         return None
 
@@ -595,19 +625,46 @@ def download_tile_3dep_1m(lat, lng, output_dir):
     if lng_floor >= 0 or lat_floor < 24 or lat_floor > 72:
         return None
 
-    if not _probe_3dep_1m_coverage(lat_floor, lng_floor):
-        return None
-
     raw_dir = Path(output_dir) / 'raw'
     raw_dir.mkdir(parents=True, exist_ok=True)
     out_path = raw_dir / f"{tile_label(lat, lng)}_1m.tif"
     native_path = raw_dir / f"{tile_label(lat, lng)}_1m_native.tif"
 
-    if (out_path.exists() and out_path.stat().st_size > 10_000
-            and _raster_is_readable(out_path)
-            and native_path.exists() and _raster_is_readable(native_path)):
+    already_downsampled = (out_path.exists() and out_path.stat().st_size > 10_000
+                            and _raster_is_readable(out_path))
+    native_ready = native_path.exists() and _raster_is_readable(native_path)
+
+    # Full cache hit -- short-circuit before any network call, and
+    # before the coverage probe below, which would otherwise discard
+    # an already-valid mosaic tile on a transient probe failure.
+    if already_downsampled and native_ready:
         print(f"  [{tile_label(lat, lng)}] Cached (1m)")
         return out_path, '1m'
+
+    # Native raster already fetched, only the resampled mosaic tile is
+    # missing (e.g. killed between the two steps on a prior run) --
+    # resample straight from the cached native file. No network calls
+    # needed at all, unlike the 3m tier's equivalent case: native_path
+    # here already *is* the full fetch result, not a separate raw file.
+    if native_ready and not already_downsampled:
+        try:
+            _resample_native_to_canonical_grid(native_path, lat_floor,
+                                                lng_floor, out_path)
+            print(f"  [{tile_label(lat, lng)}] Resampled cached native "
+                  f"(1m) to canonical grid")
+            return out_path, '1m'
+        except Exception as e:
+            print(f"  [{tile_label(lat, lng)}] Resample of cached native "
+                  f"failed ({e}) -- refetching")
+
+    # Below this point, a probe/fetch failure only costs the (still
+    # missing) native overlay backfill if a valid mosaic tile already
+    # exists -- return that cached tile instead of None so a transient
+    # failure never discards previously-good output.
+    cached_fallback = (out_path, '1m') if already_downsampled else None
+
+    if not _probe_3dep_1m_coverage(lat_floor, lng_floor):
+        return cached_fallback
 
     try:
         from elevation import (_download_tile_3dep_native,
@@ -616,7 +673,7 @@ def download_tile_3dep_1m(lat, lng, output_dir):
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 1m unavailable "
               f"(elevation.py import failed: {e})")
-        return None
+        return cached_fallback
 
     try:
         coverage = probe_3dep_1m_coverage_grid(
@@ -624,15 +681,33 @@ def download_tile_3dep_1m(lat, lng, output_dir):
         if not coverage.any():
             print(f"  [{tile_label(lat, lng)}] No coverage found on the "
                   f"coarse probe grid, skipping")
-            return None
+            return cached_fallback
 
-        _download_tile_3dep_native(
+        _, n_fetched, n_failed, _ = _download_tile_3dep_native(
             lat_floor, lng_floor, native_path,
             coverage_grid=(NATIVE_1M_PROBE_GRID_N, coverage),
             grid_n=NATIVE_1M_GRID_N, subtile_px=NATIVE_1M_SUBTILE_PX)
     except Exception as e:
         print(f"  [{tile_label(lat, lng)}] 1m fetch failed: {e}")
-        return None
+        return cached_fallback
+
+    if n_fetched == 0 and n_failed > 0:
+        # The coarse probe found coverage, but every covered sub-tile
+        # then failed to fetch (WCS outage, rate-limiting, etc.) --
+        # native_path is all nodata. Fall through to the normal
+        # cascade (or the cached tile, if there already is one)
+        # instead of reporting this as a successful '1m' tile;
+        # otherwise the caller mosaics an all-nodata raster into the
+        # study area instead of retrying at a lower resolution.
+        native_path.unlink(missing_ok=True)
+        print(f"  [{tile_label(lat, lng)}] 1m fetch found no usable data "
+              f"({n_failed} sub-tile(s) failed) -- falling back")
+        return cached_fallback
+
+    if already_downsampled:
+        print(f"  [{tile_label(lat, lng)}] Native kept at "
+              f"{native_path.name} (mosaic tile already cached)")
+        return out_path, '1m'
 
     try:
         _resample_native_to_canonical_grid(native_path, lat_floor, lng_floor,
@@ -1038,6 +1113,44 @@ def mosaic_tiles(tile_paths, output_path, bounds):
 
 
 # ─────────────────────────────────────────────
+# Direct narrow-AOI download (bypasses the whole-degree-tile pipeline)
+# ─────────────────────────────────────────────
+
+def download_direct_aoi(south, west, north, east, resolution, output_dir):
+    """
+    Fetch exactly [south, west, north, east] from 3DEP at 'resolution'
+    ('1m' or '3m'), writing a single clipped GeoTIFF to output_dir --
+    see elevation.fetch_dem_direct() for why this skips the coverage
+    probe / whole-degree sub-tile grid that download_tile_3dep_1m/_3m
+    always run, no matter how small the caller's actual area is.
+    """
+    from elevation import fetch_dem_direct
+
+    resolution_m = 1.0 if resolution == '1m' else 3.0
+    width_km  = (east - west) * 111.32 * math.cos(math.radians((south + north) / 2))
+    height_km = (north - south) * 111.32
+
+    print(f"\n{'='*62}")
+    print(f"  Direct AOI fetch")
+    print(f"  Bounds: {south}N {west}E  ->  {north}N {east}E")
+    print(f"  Size:   {width_km*1000:.0f}m x {height_km*1000:.0f}m")
+    print(f"  Res:    ~{resolution_m}m/px")
+    print(f"{'='*62}\n")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"direct_{resolution}.tif"
+
+    result = fetch_dem_direct(south, west, north, east, resolution_m, out_path)
+    if result is None:
+        print(f"\n[DIRECT] No 3DEP {resolution} coverage found for this area")
+        sys.exit(1)
+
+    print(f"\n[DIRECT] Wrote {result[0]}")
+    return result[0]
+
+
+# ─────────────────────────────────────────────
 # Main pipeline
 # ─────────────────────────────────────────────
 
@@ -1132,16 +1245,24 @@ def download_study_area(area, dry_run=False, resume=True,
             raw_dir / f"{tile_label(lat, lng)}_{native_suffix}"
             for lat, lng in tiles
         ]
-        native_paths = [p for p in native_paths if p.exists()]
+        native_paths = [p for p in native_paths if _raster_is_readable(p)]
         if not native_paths:
             print("[HIRES-VRT] No tiles got real high-resolution coverage -- skipping")
         elif not mosaic_path.exists():
             print("[HIRES-VRT] Mosaic was not written -- skipping")
         else:
             vrt_path = Path(area.output_dir) / f"{area.name}_mosaic_hires.vrt"
-            build_hires_vrt(mosaic_path, native_paths, vrt_path)
-            print(f"[HIRES-VRT] {len(native_paths)} native tile(s) layered "
-                  f"onto the mosaic -> {vrt_path}")
+            try:
+                build_hires_vrt(mosaic_path, native_paths, vrt_path)
+                print(f"[HIRES-VRT] {len(native_paths)} native tile(s) layered "
+                      f"onto the mosaic -> {vrt_path}")
+            except Exception as e:
+                # The mosaic itself is already written and reported by
+                # this point -- a bad native overlay file (e.g. left
+                # partially written by an interrupted fetch) shouldn't
+                # turn an otherwise-successful run into a crash.
+                print(f"[HIRES-VRT] Failed to build overlay VRT: {e} "
+                      f"-- mosaic is still valid without it")
 
 
 # ─────────────────────────────────────────────
@@ -1185,6 +1306,17 @@ def main():
              "<name>_mosaic_hires.vrt -- real fine detail where it was "
              "fetched, the normal 10m mosaic everywhere else. Use "
              "--resolution 1m instead for genuine ~1m/px.")
+    parser.add_argument('--direct', action='store_true',
+        help="Skip the whole-degree-tile pipeline entirely and fetch "
+             "exactly the --bounds area from 3DEP, in as few WCS "
+             "requests as the server's own per-request pixel limit "
+             "allows -- for a small AOI (a few acres up to a couple "
+             "km across) that's one request instead of probing and "
+             "fetching a whole 1-degree tile just to crop it down "
+             "afterward. Requires --bounds (corner1/corner2 only "
+             "resolve to whole-degree tiles) and --resolution 1m or "
+             "3m. Writes a single clipped GeoTIFF -- no mosaic, no "
+             "manifest, no tile cache.")
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--workers', type=int, default=4,
         help='Parallel download threads (default: 4)')
@@ -1196,6 +1328,23 @@ def main():
         help='Re-download even if tile already exists')
 
     args = parser.parse_args()
+
+    if args.direct:
+        if not args.bounds:
+            parser.error('--direct requires --bounds (fractional-degree '
+                          'precision -- corner1/corner2 only resolve to '
+                          'whole-degree tiles)')
+        if args.resolution not in ('1m', '3m'):
+            parser.error("--direct requires --resolution 1m or 3m -- the "
+                          "10m/30m/best sources aren't fetchable by "
+                          "arbitrary bbox")
+        s, w, n, e = [float(x) for x in args.bounds.split(',')]
+        download_direct_aoi(
+            south=s, west=w, north=n, east=e,
+            resolution=args.resolution,
+            output_dir=args.output_dir or 'data/dem/direct',
+        )
+        return
 
     if args.bounds:
         s, w, n, e = [float(x) for x in args.bounds.split(',')]

@@ -37,11 +37,13 @@ Select an area by its two opposite corner coordinates, given as latitude/longitu
 
 This downloads elevation data covering that rectangle and saves it as one combined .tif file in the current folder.
 
-To download available 1 meter resolution DEM within the desired bounds, simply add the `--try-1m` argument. This resolution is sparse and expensive to store, so it is saved as a separate .tif file and connected to the base 10m/30m DEM via GDAL VRT.
+To fetch the highest resolution available (genuine ~1m/px where USGS 3DEP has it surveyed), add `--resolution 1m`. Coverage is sparse, so this is saved as a separate .tif file and connected to the base 10m/30m DEM via GDAL VRT. It's also far more expensive than the default — potentially thousands of requests and tens of minutes per tile — since it streams real full-resolution data instead of a cheaper approximation.
 
 ```bash
-.venv/bin/python python/dem_download.py N44W113 N47W109 --try-1m
+.venv/bin/python python/dem_download.py N44W113 N47W109 --resolution 1m
 ```
+
+There's also a cheaper `--try-3m` tier (~3m/px, ~900 requests/tile, a few minutes) if 1m's cost isn't worth it for your area — see [High-resolution output](README.md#high-resolution-output) in the full README for the tradeoffs between the two.
 
 ## Prefer R?
 

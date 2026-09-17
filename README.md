@@ -19,6 +19,7 @@ over the result:
 |---|---|
 | [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output) below. |
 | [`build_hires_vrt.py`](python/build_hires_vrt.py) | Builds the `.vrt` described above: layers one or more higher-resolution rasters over a lower-resolution base so a single file samples fine detail where available and the base resolution elsewhere. |
+| [`visualize_hires_vrt.py`](python/visualize_hires_vrt.py) | Renders a diagnostic figure for a `dem_download.py --try-3m`/`--resolution 1m` study area: a hillshade of the composited VRT plus a coverage map/table showing which resolution tier each tile actually used and how much of it is real native data vs. filled — see [Visualizing hi-res coverage](#visualizing-hi-res-coverage) below. |
 | [`build_dem_mosaic.py`](python/build_dem_mosaic.py) | Higher-level driver: downloads a source (GLO-30 or 3DEP) and produces one water-corrected mosaic GeoTIFF. |
 | [`dem_water_correction.py`](python/dem_water_correction.py) | Flattens elevation noise inside still-water bodies (lakes, ponds, reservoirs) by sampling shoreline elevation and flood-filling, using NHD (US) or OpenStreetMap (global) water polygons. |
 | [`repair_dem_gaps.py`](python/repair_dem_gaps.py) | Finds nodata/zero gaps in an already-built mosaic and backfills them from GLO-30, then re-applies water correction. |
@@ -151,6 +152,29 @@ in the same folder.
 Not wired up yet: `tile_builder.py`'s `--source` doesn't expose either
 high-resolution tier, and `build_dem_mosaic.py` doesn't have `--try-3m` either.
 
+## Visualizing hi-res coverage
+
+```bash
+python python/visualize_hires_vrt.py data/dem/N45W111_N45W111
+```
+
+Reads a `dem_download.py` study area's `download_manifest.json` (no network,
+no re-reading the source rasters at full resolution) and renders a three-panel
+PNG: a hillshade of the composited `_mosaic_hires.vrt` (or the plain mosaic,
+if no hi-res tier was ever requested for this area), a per-tile map of which
+source each tile actually used (GLO-30/3DEP 10m/`--try-3m`/`--resolution 1m`),
+and a table of per-tile stats.
+
+A tile's resolution tier is a whole-tile choice — there's no *different*,
+lower tier recorded for the parts of a `--try-3m`/`--resolution 1m` tile its
+own fetch didn't reach (the ~3m tier gap-fills those internally from GLO-30
+without changing its resolution label; genuine ~1m can leave them as real
+nodata). So the map answers "which tier did this area use", and the table's
+`coverage_pct` column answers the different question "how much of that tier's
+own tile is actually real dense native data" — reading the map alone would
+overstate how much real high-resolution detail a mostly-uncovered
+`--resolution 1m` tile actually has.
+
 ## Visualizing a tile
 
 ```bash
@@ -212,6 +236,7 @@ python test_tile_builder.py
 python test_dem_download_3m.py
 python test_dem_download_1m.py
 python test_build_hires_vrt.py
+python test_visualize_hires_vrt.py
 ```
 
 `test_tile_builder.py` stubs out the flat pipeline scripts (`dem_download`,
