@@ -308,6 +308,20 @@ _3M_DEGRADED_WIDTH_THRESHOLD_PX = 25_000  # a real 1m sub-tiled fetch is
                                             # that means the internal
                                             # GLO-30 fallback fired
 
+# --bounds + --resolution 1m/3m auto-routing threshold (see main()) --
+# get_1deg_tiles() rounds ANY --bounds out to whichever whole degree
+# tile(s) it touches, and download_tile_3dep_1m/_3m then probe and
+# fetch that ENTIRE tile (up to ~3,100 requests for 1m) with no idea
+# the caller only wanted a fraction of it. Below this many direct
+# requests, fetching exactly the caller's bounds is unambiguously
+# cheaper than that -- comfortably under both the whole-tile grid's
+# worst case and the whole-tile coverage probe's own fixed 100-request
+# cost. Above it, the probe-then-skip-uncovered-regions optimization
+# the whole-tile pipeline does starts to actually pay for itself
+# (skipping real gaps beats blindly fetching every cell), so bigger
+# --bounds requests still go through the normal pipeline.
+_AUTO_DIRECT_REQUEST_CAP = 200
+
 
 def _resample_native_to_canonical_grid(native_path, lat_floor: int,
                                         lng_floor: int, out_path,
@@ -1116,6 +1130,23 @@ def mosaic_tiles(tile_paths, output_path, bounds):
 # Direct narrow-AOI download (bypasses the whole-degree-tile pipeline)
 # ─────────────────────────────────────────────
 
+def estimate_direct_request_count(south, west, north, east, resolution_m):
+    """
+    How many WCS requests elevation.fetch_dem_direct would actually
+    need to cover [south, west, north, east] at resolution_m m/px --
+    same grid math fetch_dem_direct itself uses, without fetching
+    anything. Used by main() to decide whether a --bounds request is
+    cheap enough to auto-route through the direct/cascade path instead
+    of the whole-degree-tile pipeline (see _AUTO_DIRECT_REQUEST_CAP).
+    """
+    from elevation import _METERS_PER_DEGREE_LAT, _WCS_MAX_REQUEST_PX
+    width_px  = max(1, round((east - west) * _METERS_PER_DEGREE_LAT / resolution_m))
+    height_px = max(1, round((north - south) * _METERS_PER_DEGREE_LAT / resolution_m))
+    grid_cols = math.ceil(width_px / _WCS_MAX_REQUEST_PX)
+    grid_rows = math.ceil(height_px / _WCS_MAX_REQUEST_PX)
+    return grid_cols * grid_rows
+
+
 def download_direct_aoi(south, west, north, east, resolution, output_dir):
     """
     --direct --top-only: fetch exactly [south, west, north, east] from
@@ -1430,6 +1461,15 @@ def main():
              "fetching a lower tier to fill it *from*, which is "
              "exactly the cost this flag exists to avoid. Use this "
              "only if you don't need gaps filled.")
+    parser.add_argument('--force-tile', action='store_true',
+        help="With --bounds and --resolution 1m/3m, always use the "
+             "whole-degree-tile pipeline (mosaic, manifest, resumable "
+             "tile cache) even when the requested area is small enough "
+             "to auto-route through the direct fetch instead (see "
+             f"_AUTO_DIRECT_REQUEST_CAP={_AUTO_DIRECT_REQUEST_CAP} in "
+             "the source). Mainly useful if you specifically want the "
+             "study-area artifacts for a small area, and are fine "
+             "paying the whole-tile cost to get them.")
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--workers', type=int, default=4,
         help='Parallel download threads (default: 4)')
@@ -1442,8 +1482,10 @@ def main():
 
     args = parser.parse_args()
 
-    if args.top_only and not args.direct:
-        parser.error('--top-only only means anything with --direct')
+    if args.top_only and not (args.direct or args.bounds):
+        parser.error('--top-only only means anything with --direct or '
+                      '--bounds (it has no effect with --force-tile or '
+                      'the whole-degree-tile pipeline)')
 
     if args.direct:
         if not args.bounds:
@@ -1466,6 +1508,34 @@ def main():
 
     if args.bounds:
         s, w, n, e = [float(x) for x in args.bounds.split(',')]
+
+        # get_1deg_tiles() below rounds ANY --bounds out to whichever
+        # whole degree tile(s) it touches, and the 1m/3m tiers then
+        # probe and fetch that ENTIRE tile with no idea the caller
+        # only wanted a fraction of it -- auto-route small requests
+        # through the direct fetch instead of ever taking that path.
+        # See _AUTO_DIRECT_REQUEST_CAP's comment for the threshold
+        # reasoning. --force-tile opts back into the whole-tile
+        # pipeline; --direct (handled above) always skips it.
+        if args.resolution in ('1m', '3m') and not args.force_tile:
+            resolution_m = 1.0 if args.resolution == '1m' else 3.0
+            n_requests = estimate_direct_request_count(s, w, n, e, resolution_m)
+            if n_requests <= _AUTO_DIRECT_REQUEST_CAP:
+                print(f"[AUTO] --bounds only needs {n_requests} direct "
+                      f"request(s) at {args.resolution} -- far cheaper than "
+                      f"probing and fetching the whole degree-tile(s) this "
+                      f"area touches, so routing through the direct fetch "
+                      f"instead. Pass --force-tile for the whole-tile "
+                      f"pipeline (mosaic/manifest/resumable cache) anyway.")
+                out_dir = args.output_dir or 'data/dem/direct'
+                if args.top_only:
+                    download_direct_aoi(south=s, west=w, north=n, east=e,
+                                         resolution=args.resolution, output_dir=out_dir)
+                else:
+                    download_cascade_aoi(south=s, west=w, north=n, east=e,
+                                          resolution=args.resolution, output_dir=out_dir)
+                return
+
         area = StudyArea(
             name='custom',
             description='Custom area',

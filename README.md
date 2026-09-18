@@ -17,7 +17,7 @@ over the result:
 
 | Script | Purpose |
 |---|---|
-| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output). `--direct` fetches a small AOI directly instead of a whole tile — see [Direct AOI fetch](#direct-aoi-fetch). |
+| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output). A small `--bounds` at `--resolution 1m`/`3m` auto-fetches just that AOI instead of a whole tile — see [Direct AOI fetch](#direct-aoi-fetch). |
 | [`build_hires_vrt.py`](python/build_hires_vrt.py) | Builds the `.vrt` described above: layers one or more higher-resolution rasters over a lower-resolution base so a single file samples fine detail where available and the base resolution elsewhere. |
 | [`visualize_hires_vrt.py`](python/visualize_hires_vrt.py) | Renders a diagnostic figure for a `dem_download.py --try-3m`/`--resolution 1m` study area: a hillshade of the composited VRT plus a per-*tile* coverage map/table — see [Visualizing hi-res coverage](#visualizing-hi-res-coverage). |
 | [`visualize_cascade_aoi.py`](python/visualize_cascade_aoi.py) | Same idea for a `--direct` AOI, but per-*pixel* rather than per-tile (the AOI is small enough to check every pixel directly) — see [Direct AOI fetch](#direct-aoi-fetch). |
@@ -150,22 +150,30 @@ high-resolution tier, and `build_dem_mosaic.py` doesn't have `--try-3m` either.
 ## Direct AOI fetch
 
 For an area much smaller than a full 1° tile — a few acres up to a couple km
-across — `--direct` skips the whole-tile pipeline entirely and fetches
-exactly the requested `--bounds`, in as few requests as each source's own
-per-request limit allows (often just one). By default it also crops the 10m
-3DEP and 30m GLO-30 base tiers for the same bounds (windowed range-reads
-against the live S3 sources — no full-tile download) and composites all
-three into one VRT: real detail where 3DEP has it, 10m/30m filling any gap
-in it — the same fallback priority the whole-tile pipeline uses, scoped to
-just the requested area.
+across — fetching exactly the requested `--bounds` (as few requests as each
+source's own per-request limit allows, often just one) is drastically
+cheaper than the whole-tile pipeline, which always probes and fetches an
+*entire* 1° tile regardless of how small the actual request is. **This is
+automatic**, not something you have to remember to ask for: any
+`--bounds` request with `--resolution 1m`/`3m` that would need
+`_AUTO_DIRECT_REQUEST_CAP` (200) or fewer direct requests routes through
+this path with no extra flag. `--direct` forces it regardless of size;
+`--force-tile` forces the whole-tile pipeline instead (mainly useful if you
+specifically want the study-area artifacts — mosaic, manifest, resumable
+cache — for a small area and are fine paying for them).
 
 ```bash
+# No flag needed -- this auto-routes because the area is small.
 python python/dem_download.py --bounds "44.50000,-110.20000,44.50128,-110.19873" \
-    --resolution 1m --direct
+    --resolution 1m
 ```
 
-Requires `--bounds` and `--resolution 1m`/`3m` (the tier to fetch). Writes
-`cascade_manifest.json` plus whichever of
+By default this also crops the 10m 3DEP and 30m GLO-30 base tiers for the
+same bounds (windowed range-reads against the live S3 sources — no
+full-tile download) and composites all three into one VRT: real detail
+where 3DEP has it, 10m/30m filling any gap in it — the same fallback
+priority the whole-tile pipeline uses, scoped to just the requested area.
+Writes `cascade_manifest.json` plus whichever of
 `native_<res>.tif`/`base_10m.tif`/`base_30m.tif` actually returned data —
 render it with `visualize_cascade_aoi.py` for a per-pixel resolution map.
 
@@ -174,9 +182,16 @@ VRT, one clipped GeoTIFF, 2 fewer requests. The tradeoff: any gap in that
 tier's own coverage is left as real nodata instead of being filled, since
 filling it needs exactly the extra fetches this flag skips.
 
-Known limitation: the 10m/30m crops pick a single source tile from the AOI's
-center point, so an AOI straddling a whole-degree line (rare, but it can
-coincide with an international border) may miss data just past that seam.
+Known limitations:
+- The 10m/30m crops pick a single source tile from the AOI's center point,
+  so an AOI straddling a whole-degree line (rare, but it can coincide with
+  an international border) may miss data just past that seam.
+- The auto-route threshold only weighs direct-fetch cost against the
+  whole-tile pipeline's worst case — it doesn't know whether coverage in
+  your area is sparse enough that the whole-tile pipeline's own coverage
+  probe would've skipped most of it. For a `--bounds` near the 200-request
+  threshold in an area you know has patchy coverage, `--force-tile` may
+  actually be cheaper.
 
 ## Visualizing hi-res coverage
 
