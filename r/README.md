@@ -1,8 +1,9 @@
 # R port
 
-An R translation of the core DEM processing pipeline from
-[`python/`](../python/) — the download, mosaic, and correction logic,
-not the tile-cache infrastructure or GPU/parallel plumbing. See
+An R translation of the core DEM (Digital Elevation Model) processing
+pipeline from [`python/`](../python/) — the download, mosaic, and
+correction logic, not the tile-cache infrastructure or GPU/parallel
+plumbing. See
 [Scope](#scope) below for exactly what that means and why.
 
 ## Setup
@@ -12,8 +13,9 @@ Rscript -e 'install.packages(c("terra", "httr2", "jsonlite", "maps"))'
 ```
 
 `terra` handles all raster I/O and
-processing; `httr2` handles the NHD/OSM/USGS/Copernicus HTTP calls;
-`maps` backs the ocean-tile detection. `sf` is optional — see
+processing; `httr2` handles the NHD (National Hydrography Dataset)/OSM
+(OpenStreetMap)/USGS (United States Geological Survey)/Copernicus HTTP
+calls; `maps` backs the ocean-tile detection. `sf` is optional — see
 [Dependency notes](#dependency-notes).
 
 ## Usage
@@ -23,7 +25,7 @@ cd r
 # Area = the rectangle spanning any two opposite 1x1-degree tile
 # corners (order doesn't matter) -- see bounds_from_tile_corners() in
 # tile_id.R. Requests over 25 degree-tiles are refused by default
-# (allow_large=TRUE to override); each 3DEP 10m tile runs ~200-300MB.
+# (allow_large=TRUE to override); each 3DEP (3D Elevation Program) 10m tile runs ~200-300MB.
 Rscript -e 'source("dem_download.R"); download_study_area(study_area_between("N44W113", "N47W109"), dry_run=TRUE)'
 Rscript -e 'source("dem_water_correction.R"); correct_dem_water_bodies("in.tif", "out.tif", fetch_water_bodies_nhd(c(45,-111,46,-110)))'
 Rscript -e 'source("precompute_flat_mask.R"); compute_flat_mask("dem.tif", "flat.tif")'
@@ -31,8 +33,9 @@ Rscript test_tile_id.R   # the only file with a ported test suite so far
 ```
 
 These files are meant to be `source()`d and called from an R session
-or script, not run as standalone CLIs the way the Python originals
-are — no `optparse`/argparse-equivalent CLI wrapper was added, to keep
+or script, not run as standalone CLIs the way
+the Python originals are — no `optparse`/argparse-equivalent CLI wrapper
+was added, to keep
 the dependency list to exactly the four packages above.
 
 ## Files
@@ -43,7 +46,7 @@ the dependency list to exactly the four packages above.
 | [`dem_download.R`](dem_download.R) | `dem_download.py` | Sequential downloads (see below); ocean check via `maps` instead of `global_land_mask`. |
 | [`precompute_flat_mask.R`](precompute_flat_mask.R) | `precompute_flat_mask.py` | Only `compute_flat_mask`/`compute_flat_regions` — the `load_*`/`slice_flat_mask` readers exist solely to serve a downstream compute engine. |
 | [`dem_water_correction.R`](dem_water_correction.R) | `dem_water_correction.py` | Serial/CPU path only (see below); `correct` is the only ported CLI subcommand. |
-| [`elevation.R`](elevation.R) | `elevation.py` | On-demand single-tile/single-point elevation lookup with its own disk cache (`DEM_CACHE_DIR`) — distinct from `dem_download.R`'s study-area pipeline. 3DEP downloads via a parallel sub-tiled WCS grid (`httr2::req_perform_parallel()` in place of the original's `ThreadPoolExecutor`); `_get_3dep_url()` not ported (dead code in the Python original — defined, never called). |
+| [`elevation.R`](elevation.R) | `elevation.py` | On-demand single-tile/single-point elevation lookup with its own disk cache (`DEM_CACHE_DIR`) — distinct from `dem_download.R`'s study-area pipeline. 3DEP downloads via a parallel sub-tiled WCS (Web Coverage Service) grid (`httr2::req_perform_parallel()` in place of the original's `ThreadPoolExecutor`); `_get_3dep_url()` not ported (dead code in the Python original — defined, never called). |
 | [`build_dem_mosaic.R`](build_dem_mosaic.R) | `build_dem_mosaic.py` | Uses `elevation.R`'s `download_tile()`/`is_in_3dep_coverage()`, matching the Python original's own import. |
 | [`repair_dem_gaps.R`](repair_dem_gaps.R) | `repair_dem_gaps.py` | Uses `elevation.R`'s `download_tile_glo30()`, matching the Python original's own import. |
 
@@ -73,14 +76,14 @@ it back if a real multi-tile study area needs it.
 for polygon construction in R. It pulls in the `units` package, which
 needs the system library `libudunits2` — not always preinstalled, and
 not something to require of anyone who just wants to run this (install
-via your OS's package manager if you want it: `libudunits2-dev` on
-Debian/Ubuntu, `udunits` via Homebrew on macOS, an AUR package on
-Arch). So:
+via your OS's package manager if you want it:
+`libudunits2-dev` on Debian/Ubuntu, `udunits` via Homebrew on macOS, an
+AUR (Arch User Repository) package on Arch). So:
 
 - All polygon construction on the hot path (batch rasterization in
   `dem_water_correction.R`) uses `terra`'s own `vect()` via WKT
-  strings instead — no `sf` involved at all in the actual correction
-  algorithm.
+  (Well-Known Text) strings instead — no `sf` involved at all in the
+  actual correction algorithm.
 - The one place `sf` is genuinely the right tool — `fetch_ocean_polygons_osm`'s
   polygonize/union/difference chain, building ocean-fill polygons from
   coastline linework — checks `requireNamespace("sf")` at runtime and
@@ -180,9 +183,9 @@ or in a few cases, already do:
   Fixed on the Python side by using `merge()`'s own `dst_path`/
   `dst_kwds`/`mem_limit` parameters (already present in the installed
   rasterio version, just unused) to merge, crop, and write in bounded
-  windows instead — peak RSS dropped to ~2.5GB regardless of study-area
-  size, confirmed bit-identical output via a windowed diff. No R-side
-  change needed.
+  windows instead — peak RSS (Resident Set Size) dropped to ~2.5GB
+  regardless of study-area size, confirmed bit-identical output via a
+  windowed diff. No R-side change needed.
 - **Sub-tile merge doesn't reliably reconstruct the exact 3DEP grid.**
   `download_tile_3dep_subtiled()` in both `elevation.R` and
   `elevation.py` builds a 1x1 degree tile from a 9x9 grid of WCS

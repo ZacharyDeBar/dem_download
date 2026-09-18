@@ -29,7 +29,7 @@ This creates a private folder (`.venv`) with everything the tool needs, isolated
 
 ## 4. Download elevation data
 
-Select an area by its two opposite corner coordinates, given as latitude/longitude points in the form `N44W113` (44°N, 113°W). Then run:
+Select a region of whole degree tiles by its two opposite corner coordinates, given as latitude/longitude points in the form `N44W113` (44°N, 113°W). Then run:
 
 ```bash
 .venv/bin/python python/dem_download.py N44W113 N47W109
@@ -37,12 +37,13 @@ Select an area by its two opposite corner coordinates, given as latitude/longitu
 
 This downloads elevation data covering that rectangle and saves it as one combined .tif file in the current folder.
 
-To fetch the highest resolution available (genuine ~1m/px where USGS 3DEP has it surveyed), add `--resolution 1m`. Coverage is sparse, so this is saved as a separate .tif file and connected to the base 10m/30m DEM via GDAL VRT. It's also far more expensive than the default — potentially thousands of requests and tens of minutes per tile — since it streams real full-resolution data instead of a cheaper approximation.
+To fetch the highest resolution available, ~1m/px via USGS (United States Geological Survey) 3DEP (3D Elevation Program), add `--resolution 1m`. Coverage is sparse, so this is saved as a separate .tif file and connected to the base 10m/30m DEM (Digital Elevation Model) via GDAL (Geospatial Data Abstraction Library) VRT (Virtual Raster) to prevent coverage gaps. It's also far more expensive in both time to download and storage cost (over 50GB per tile), so it's recommended to narrow the request to a sub-tile region with the --bounds flag and diagonal corner input as shown here:
 
 ```bash
-.venv/bin/python python/dem_download.py N44W113 N47W109 --resolution 1m
+python python/dem_download.py --bounds "43.6150,-116.2050,43.6186,-116.2005" --resolution 1m
+
 ```
-There's also a cheaper `--try-3m` tier (~3m/px, ~900 requests/tile, a few minutes) if 1m's cost isn't worth it for your area — see [High-resolution output](README.md#high-resolution-output) in the full README for the tradeoffs between the two.
+
 
 
 ## Prefer R?
@@ -53,6 +54,6 @@ Rscript -e 'install.packages(c("terra", "httr2", "jsonlite", "maps"))'
 
 See [r/README.md](r/README.md) for how to run the R version.
 
-## Want more control?
+## For more details:
 
-The [full README](README.md) covers all scripts and command-line options.
+[README](README.md) covers all scripts and command-line options.
