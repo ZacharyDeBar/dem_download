@@ -17,10 +17,10 @@ over the result:
 
 | Script | Purpose |
 |---|---|
-| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output). `--direct`/`--cascade` fetch a small AOI directly instead of a whole tile — see [Direct & cascade AOI fetch](#direct--cascade-aoi-fetch). |
+| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output). `--direct` fetches a small AOI directly instead of a whole tile — see [Direct AOI fetch](#direct-aoi-fetch). |
 | [`build_hires_vrt.py`](python/build_hires_vrt.py) | Builds the `.vrt` described above: layers one or more higher-resolution rasters over a lower-resolution base so a single file samples fine detail where available and the base resolution elsewhere. |
 | [`visualize_hires_vrt.py`](python/visualize_hires_vrt.py) | Renders a diagnostic figure for a `dem_download.py --try-3m`/`--resolution 1m` study area: a hillshade of the composited VRT plus a per-*tile* coverage map/table — see [Visualizing hi-res coverage](#visualizing-hi-res-coverage). |
-| [`visualize_cascade_aoi.py`](python/visualize_cascade_aoi.py) | Same idea for a `--cascade` AOI, but per-*pixel* rather than per-tile (the AOI is small enough to check every pixel directly) — see [Direct & cascade AOI fetch](#direct--cascade-aoi-fetch). |
+| [`visualize_cascade_aoi.py`](python/visualize_cascade_aoi.py) | Same idea for a `--direct` AOI, but per-*pixel* rather than per-tile (the AOI is small enough to check every pixel directly) — see [Direct AOI fetch](#direct-aoi-fetch). |
 | [`build_dem_mosaic.py`](python/build_dem_mosaic.py) | Higher-level driver: downloads a source (GLO-30 or 3DEP) and produces one water-corrected mosaic GeoTIFF. |
 | [`dem_water_correction.py`](python/dem_water_correction.py) | Flattens elevation noise inside still-water bodies (lakes, ponds, reservoirs) by sampling shoreline elevation and flood-filling, using NHD (US) or OpenStreetMap (global) water polygons. |
 | [`repair_dem_gaps.py`](python/repair_dem_gaps.py) | Finds nodata/zero gaps in an already-built mosaic and backfills them from GLO-30, then re-applies water correction. |
@@ -147,32 +147,32 @@ in the same folder.
 Not wired up yet: `tile_builder.py`'s `--source` doesn't expose either
 high-resolution tier, and `build_dem_mosaic.py` doesn't have `--try-3m` either.
 
-## Direct & cascade AOI fetch
+## Direct AOI fetch
 
 For an area much smaller than a full 1° tile — a few acres up to a couple km
-across — `--direct` and `--cascade` skip the whole-tile pipeline entirely and
-fetch exactly the requested `--bounds`, in as few requests as each source's
-own per-request limit allows (often just one):
+across — `--direct` skips the whole-tile pipeline entirely and fetches
+exactly the requested `--bounds`, in as few requests as each source's own
+per-request limit allows (often just one). By default it also crops the 10m
+3DEP and 30m GLO-30 base tiers for the same bounds (windowed range-reads
+against the live S3 sources — no full-tile download) and composites all
+three into one VRT: real detail where 3DEP has it, 10m/30m filling any gap
+in it — the same fallback priority the whole-tile pipeline uses, scoped to
+just the requested area.
 
 ```bash
-# Exactly this bbox at genuine ~1m/px -- one clipped GeoTIFF, no mosaic,
-# no manifest, no tile cache.
 python python/dem_download.py --bounds "44.50000,-110.20000,44.50128,-110.19873" \
     --resolution 1m --direct
-
-# Same AOI, but also crops the 10m 3DEP and 30m GLO-30 base tiers for the
-# same bounds (windowed range-reads against the live S3 sources -- no
-# full-tile download) and composites all three into one VRT: real detail
-# where 3DEP has it, falling back through 10m/30m elsewhere -- the same
-# priority the whole-tile pipeline uses, scoped to just the requested area.
-python python/dem_download.py --bounds "44.50000,-110.20000,44.50128,-110.19873" \
-    --resolution 1m --cascade
 ```
 
-Both require `--bounds` and `--resolution 1m`/`3m` (the top tier to try).
-`--cascade` writes `cascade_manifest.json` plus whichever of
+Requires `--bounds` and `--resolution 1m`/`3m` (the tier to fetch). Writes
+`cascade_manifest.json` plus whichever of
 `native_<res>.tif`/`base_10m.tif`/`base_30m.tif` actually returned data —
 render it with `visualize_cascade_aoi.py` for a per-pixel resolution map.
+
+Add `--top-only` to fetch just the `--resolution` tier — no 10m/30m crops, no
+VRT, one clipped GeoTIFF, 2 fewer requests. The tradeoff: any gap in that
+tier's own coverage is left as real nodata instead of being filled, since
+filling it needs exactly the extra fetches this flag skips.
 
 Known limitation: the 10m/30m crops pick a single source tile from the AOI's
 center point, so an AOI straddling a whole-degree line (rare, but it can

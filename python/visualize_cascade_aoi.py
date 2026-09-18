@@ -1,7 +1,7 @@
 """
 visualize_cascade_aoi.py
 ━━━━━━━━━━━━━━━━━━━━━━━━
-Renders a diagnostic report for a dem_download.py --cascade AOI
+Renders a diagnostic report for a dem_download.py --direct AOI
 (cascade_manifest.json + whichever of base_30m.tif/base_10m.tif/
 native_<res>.tif actually got real data): a hillshade of the
 composited result, plus a per-pixel map of which tier actually
@@ -9,14 +9,15 @@ supplied each pixel's value.
 
 This is genuinely per-pixel, unlike visualize_hires_vrt.py's coverage
 map (which is necessarily per-*tile*, since a whole-degree study area
-can only record one resolution label per tile) -- a --cascade AOI is
+can only record one resolution label per tile) -- a --direct AOI is
 small enough (a few acres to a couple km) to check every pixel
 directly against each of the (at most three) known layer files instead
-of decimating or sampling.
+of decimating or sampling. Not produced by --direct --top-only, which
+skips the base-tier crops entirely.
 
 Usage:
-    python visualize_cascade_aoi.py data/dem/cascade_<name>
-    python visualize_cascade_aoi.py data/dem/cascade_<name> --output report.png
+    python visualize_cascade_aoi.py data/dem/direct_<name>
+    python visualize_cascade_aoi.py data/dem/direct_<name> --output report.png
 """
 
 import argparse
@@ -184,10 +185,10 @@ def build_report(cascade_dir: Path, output: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize a dem_download.py --cascade AOI's per-pixel "
+        description="Visualize a dem_download.py --direct AOI's per-pixel "
                     "resolution provenance.")
     parser.add_argument('cascade_dir',
-        help='--cascade output directory (dem_download.py --output-dir)')
+        help='--direct output directory (dem_download.py --output-dir)')
     parser.add_argument('--output', default=None,
         help='Output image path (default: <cascade_dir>/cascade_report.png)')
     args = parser.parse_args()

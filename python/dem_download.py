@@ -1118,11 +1118,18 @@ def mosaic_tiles(tile_paths, output_path, bounds):
 
 def download_direct_aoi(south, west, north, east, resolution, output_dir):
     """
-    Fetch exactly [south, west, north, east] from 3DEP at 'resolution'
-    ('1m' or '3m'), writing a single clipped GeoTIFF to output_dir --
-    see elevation.fetch_dem_direct() for why this skips the coverage
+    --direct --top-only: fetch exactly [south, west, north, east] from
+    3DEP at 'resolution' ('1m' or '3m') alone, writing a single
+    clipped GeoTIFF to output_dir -- no 10m/30m base crops, no VRT.
+    See elevation.fetch_dem_direct() for why this skips the coverage
     probe / whole-degree sub-tile grid that download_tile_3dep_1m/_3m
     always run, no matter how small the caller's actual area is.
+
+    Cheaper than download_cascade_aoi (2 fewer requests, no VRT build),
+    but any gap in this tier's own coverage is left as real nodata --
+    there's nothing else fetched to fill it from. download_cascade_aoi
+    is what --direct calls by default; this is only the --top-only
+    opt-out.
     """
     from elevation import fetch_dem_direct
 
@@ -1152,14 +1159,14 @@ def download_direct_aoi(south, west, north, east, resolution, output_dir):
 
 def download_cascade_aoi(south, west, north, east, resolution, output_dir):
     """
-    Like download_direct_aoi, but also fetches narrow crops of the
-    3DEP 10m and GLO-30 30m base tiers for the same bounds (via
-    elevation.fetch_vsicurl_crop -- windowed range-reads against the
-    live S3 sources, no full-tile download) and composites all three
-    into a single VRT via build_hires_vrt(), highest-resolution-
-    available per pixel. Same fallback priority the whole-tile
-    pipeline uses (native 1m/3m > 3DEP 10m > GLO-30), scoped to
-    exactly the requested area instead of a whole degree-tile.
+    --direct's default behavior: fetches native 'resolution' plus
+    narrow crops of the 3DEP 10m and GLO-30 30m base tiers for the
+    same bounds (via elevation.fetch_vsicurl_crop -- windowed
+    range-reads against the live S3 sources, no full-tile download)
+    and composites all three into a single VRT via build_hires_vrt(),
+    highest-resolution-available per pixel. Same fallback priority the
+    whole-tile pipeline uses (native 1m/3m > 3DEP 10m > GLO-30), scoped
+    to exactly the requested area instead of a whole degree-tile.
 
     Writes whichever of native_<resolution>.tif / base_10m.tif /
     base_30m.tif actually returned data, a cascade.vrt compositing
@@ -1402,25 +1409,27 @@ def main():
              "--resolution 1m instead for genuine ~1m/px.")
     parser.add_argument('--direct', action='store_true',
         help="Skip the whole-degree-tile pipeline entirely and fetch "
-             "exactly the --bounds area from 3DEP, in as few WCS "
-             "requests as the server's own per-request pixel limit "
-             "allows -- for a small AOI (a few acres up to a couple "
-             "km across) that's one request instead of probing and "
-             "fetching a whole 1-degree tile just to crop it down "
-             "afterward. Requires --bounds (corner1/corner2 only "
-             "resolve to whole-degree tiles) and --resolution 1m or "
-             "3m. Writes a single clipped GeoTIFF -- no mosaic, no "
-             "manifest, no tile cache.")
-    parser.add_argument('--cascade', action='store_true',
-        help="Like --direct, but also fetches narrow crops of the "
-             "10m 3DEP and 30m GLO-30 base tiers for the same "
-             "--bounds (windowed range-reads, no full-tile download) "
-             "and composites all three into one VRT -- real detail "
-             "where 3DEP has it, falling back through 10m/30m "
-             "elsewhere, the same priority the whole-tile pipeline "
-             "uses, scoped to exactly the requested area. Requires "
-             "--bounds and --resolution 1m or 3m (the top tier to "
-             "try first).")
+             "exactly the --bounds area instead -- for a small AOI (a "
+             "few acres up to a couple km across) that's one WCS "
+             "request instead of probing and fetching a whole "
+             "1-degree tile just to crop it down afterward. Requires "
+             "--bounds (corner1/corner2 only resolve to whole-degree "
+             "tiles) and --resolution 1m or 3m (the tier to fetch). "
+             "By default also crops the 10m 3DEP and 30m GLO-30 base "
+             "tiers for the same bounds (windowed range-reads, no "
+             "full-tile download) and composites all three into one "
+             "VRT, same fallback priority as the whole-tile pipeline "
+             "-- real detail where 3DEP has it, 10m/30m filling any "
+             "gap in it. Pass --top-only to skip that (see --top-only).")
+    parser.add_argument('--top-only', action='store_true',
+        help="With --direct, fetch only the --resolution tier -- no "
+             "10m/30m base crops, no VRT, one clipped GeoTIFF. Cheaper "
+             "(skips 2 requests), but any gap in that tier's own "
+             "coverage is left as real nodata instead of being filled "
+             "from a lower tier -- there's no way to fill it without "
+             "fetching a lower tier to fill it *from*, which is "
+             "exactly the cost this flag exists to avoid. Use this "
+             "only if you don't need gaps filled.")
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--workers', type=int, default=4,
         help='Parallel download threads (default: 4)')
@@ -1433,22 +1442,8 @@ def main():
 
     args = parser.parse_args()
 
-    if args.cascade:
-        if not args.bounds:
-            parser.error('--cascade requires --bounds (fractional-degree '
-                          'precision -- corner1/corner2 only resolve to '
-                          'whole-degree tiles)')
-        if args.resolution not in ('1m', '3m'):
-            parser.error("--cascade requires --resolution 1m or 3m -- "
-                          "that's the top tier it tries before falling "
-                          "back to 10m/30m")
-        s, w, n, e = [float(x) for x in args.bounds.split(',')]
-        download_cascade_aoi(
-            south=s, west=w, north=n, east=e,
-            resolution=args.resolution,
-            output_dir=args.output_dir or 'data/dem/cascade',
-        )
-        return
+    if args.top_only and not args.direct:
+        parser.error('--top-only only means anything with --direct')
 
     if args.direct:
         if not args.bounds:
@@ -1460,11 +1455,13 @@ def main():
                           "10m/30m/best sources aren't fetchable by "
                           "arbitrary bbox")
         s, w, n, e = [float(x) for x in args.bounds.split(',')]
-        download_direct_aoi(
-            south=s, west=w, north=n, east=e,
-            resolution=args.resolution,
-            output_dir=args.output_dir or 'data/dem/direct',
-        )
+        out_dir = args.output_dir or 'data/dem/direct'
+        if args.top_only:
+            download_direct_aoi(south=s, west=w, north=n, east=e,
+                                 resolution=args.resolution, output_dir=out_dir)
+        else:
+            download_cascade_aoi(south=s, west=w, north=n, east=e,
+                                  resolution=args.resolution, output_dir=out_dir)
         return
 
     if args.bounds:
