@@ -1150,6 +1150,100 @@ def download_direct_aoi(south, west, north, east, resolution, output_dir):
     return result[0]
 
 
+def download_cascade_aoi(south, west, north, east, resolution, output_dir):
+    """
+    Like download_direct_aoi, but also fetches narrow crops of the
+    3DEP 10m and GLO-30 30m base tiers for the same bounds (via
+    elevation.fetch_vsicurl_crop -- windowed range-reads against the
+    live S3 sources, no full-tile download) and composites all three
+    into a single VRT via build_hires_vrt(), highest-resolution-
+    available per pixel. Same fallback priority the whole-tile
+    pipeline uses (native 1m/3m > 3DEP 10m > GLO-30), scoped to
+    exactly the requested area instead of a whole degree-tile.
+
+    Writes whichever of native_<resolution>.tif / base_10m.tif /
+    base_30m.tif actually returned data, a cascade.vrt compositing
+    them, and cascade_manifest.json describing which tiers
+    contributed -- for visualize_cascade_aoi.py to render.
+    """
+    from elevation import fetch_dem_direct, fetch_vsicurl_crop, get_tile_url
+
+    resolution_m = 1.0 if resolution == '1m' else 3.0
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*62}")
+    print(f"  Cascade AOI fetch (native {resolution} -> 10m -> 30m)")
+    print(f"  Bounds: {south}N {west}E  ->  {north}N {east}E")
+    print(f"{'='*62}\n")
+
+    lat_c, lng_c = (south + north) / 2, (west + east) / 2
+
+    # Lowest priority first -- overlay_paths passed to build_hires_vrt
+    # below draws each layer on top of the ones before it, so this
+    # list's order IS the fallback priority order.
+    layers = []
+
+    print("[CASCADE] Fetching GLO-30 (30m) base crop...")
+    glo30_url = get_tile_url(lat_c, lng_c)
+    base_30m = fetch_vsicurl_crop(glo30_url, south, west, north, east,
+                                   30.0, out_dir / 'base_30m.tif')
+    if base_30m:
+        layers.append(('30m', base_30m))
+        print(f"  [CASCADE] GLO-30 crop: {base_30m}")
+    else:
+        print("  [CASCADE] No GLO-30 data for this area "
+              "(unexpected -- it's global coverage)")
+
+    print("[CASCADE] Fetching 3DEP 10m base crop...")
+    url_10m = url_3dep_10m_direct(math.floor(lat_c), math.floor(lng_c))
+    base_10m = (fetch_vsicurl_crop(url_10m, south, west, north, east,
+                                    10.0, out_dir / 'base_10m.tif')
+                if url_10m else None)
+    if base_10m:
+        layers.append(('10m', base_10m))
+        print(f"  [CASCADE] 3DEP 10m crop: {base_10m}")
+    else:
+        print("  [CASCADE] No 3DEP 10m coverage for this area")
+
+    print(f"[CASCADE] Fetching native {resolution}...")
+    result = fetch_dem_direct(south, west, north, east, resolution_m,
+                               out_dir / f'native_{resolution}.tif')
+    if result:
+        layers.append((resolution, result[0]))
+        print(f"  [CASCADE] Native {resolution}: {result[0]}")
+    else:
+        print(f"  [CASCADE] No native {resolution} coverage for this area")
+
+    if not layers:
+        print("\n[CASCADE] No data at any tier for this area")
+        sys.exit(1)
+
+    base_label, base_path = layers[0]
+    overlay_paths = [p for _, p in layers[1:]]
+    if overlay_paths:
+        vrt_path = out_dir / 'cascade.vrt'
+        build_hires_vrt(base_path, overlay_paths, vrt_path)
+    else:
+        vrt_path = base_path  # only one tier came back -- nothing to overlay
+
+    manifest = {
+        'bounds': [south, west, north, east],
+        'top_resolution': resolution,
+        'layers': [{'tier': label, 'file': str(p)} for label, p in layers],
+        'composite': str(vrt_path),
+    }
+    manifest_path = out_dir / 'cascade_manifest.json'
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\n[CASCADE] Tiers used (low to high priority): "
+          f"{', '.join(label for label, _ in layers)}")
+    print(f"[CASCADE] Composite: {vrt_path}")
+    print(f"[CASCADE] Manifest:  {manifest_path}")
+    return vrt_path, manifest
+
+
 # ─────────────────────────────────────────────
 # Main pipeline
 # ─────────────────────────────────────────────
@@ -1317,6 +1411,16 @@ def main():
              "resolve to whole-degree tiles) and --resolution 1m or "
              "3m. Writes a single clipped GeoTIFF -- no mosaic, no "
              "manifest, no tile cache.")
+    parser.add_argument('--cascade', action='store_true',
+        help="Like --direct, but also fetches narrow crops of the "
+             "10m 3DEP and 30m GLO-30 base tiers for the same "
+             "--bounds (windowed range-reads, no full-tile download) "
+             "and composites all three into one VRT -- real detail "
+             "where 3DEP has it, falling back through 10m/30m "
+             "elsewhere, the same priority the whole-tile pipeline "
+             "uses, scoped to exactly the requested area. Requires "
+             "--bounds and --resolution 1m or 3m (the top tier to "
+             "try first).")
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--workers', type=int, default=4,
         help='Parallel download threads (default: 4)')
@@ -1328,6 +1432,23 @@ def main():
         help='Re-download even if tile already exists')
 
     args = parser.parse_args()
+
+    if args.cascade:
+        if not args.bounds:
+            parser.error('--cascade requires --bounds (fractional-degree '
+                          'precision -- corner1/corner2 only resolve to '
+                          'whole-degree tiles)')
+        if args.resolution not in ('1m', '3m'):
+            parser.error("--cascade requires --resolution 1m or 3m -- "
+                          "that's the top tier it tries before falling "
+                          "back to 10m/30m")
+        s, w, n, e = [float(x) for x in args.bounds.split(',')]
+        download_cascade_aoi(
+            south=s, west=w, north=n, east=e,
+            resolution=args.resolution,
+            output_dir=args.output_dir or 'data/dem/cascade',
+        )
+        return
 
     if args.direct:
         if not args.bounds:

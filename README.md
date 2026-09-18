@@ -17,9 +17,10 @@ over the result:
 
 | Script | Purpose |
 |---|---|
-| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output) below. |
+| [`dem_download.py`](python/dem_download.py) | Primary driver script. Downloads and mosaics the best available DEM tiles for an input study area. Default cascade: 3DEP 10m → GLO-30. Two opt-in tiers fetch USGS 3DEP's finest data on top of that — `--try-3m` (really ~3m/px, 900 WCS requests/tile) and `--resolution 1m` (genuine ~1m/px, far more expensive) — see [High-resolution output](#high-resolution-output). `--direct`/`--cascade` fetch a small AOI directly instead of a whole tile — see [Direct & cascade AOI fetch](#direct--cascade-aoi-fetch). |
 | [`build_hires_vrt.py`](python/build_hires_vrt.py) | Builds the `.vrt` described above: layers one or more higher-resolution rasters over a lower-resolution base so a single file samples fine detail where available and the base resolution elsewhere. |
-| [`visualize_hires_vrt.py`](python/visualize_hires_vrt.py) | Renders a diagnostic figure for a `dem_download.py --try-3m`/`--resolution 1m` study area: a hillshade of the composited VRT plus a coverage map/table showing which resolution tier each tile actually used and how much of it is real native data vs. filled — see [Visualizing hi-res coverage](#visualizing-hi-res-coverage) below. |
+| [`visualize_hires_vrt.py`](python/visualize_hires_vrt.py) | Renders a diagnostic figure for a `dem_download.py --try-3m`/`--resolution 1m` study area: a hillshade of the composited VRT plus a per-*tile* coverage map/table — see [Visualizing hi-res coverage](#visualizing-hi-res-coverage). |
+| [`visualize_cascade_aoi.py`](python/visualize_cascade_aoi.py) | Same idea for a `--cascade` AOI, but per-*pixel* rather than per-tile (the AOI is small enough to check every pixel directly) — see [Direct & cascade AOI fetch](#direct--cascade-aoi-fetch). |
 | [`build_dem_mosaic.py`](python/build_dem_mosaic.py) | Higher-level driver: downloads a source (GLO-30 or 3DEP) and produces one water-corrected mosaic GeoTIFF. |
 | [`dem_water_correction.py`](python/dem_water_correction.py) | Flattens elevation noise inside still-water bodies (lakes, ponds, reservoirs) by sampling shoreline elevation and flood-filling, using NHD (US) or OpenStreetMap (global) water polygons. |
 | [`repair_dem_gaps.py`](python/repair_dem_gaps.py) | Finds nodata/zero gaps in an already-built mosaic and backfills them from GLO-30, then re-applies water correction. |
@@ -122,24 +123,18 @@ surveyed (coverage is sparse — most areas have none):
 | Time per tile | a few minutes | tens of minutes for a well-covered tile |
 
 `--try-3m` requests a 30×30 grid of sub-tiles (900 requests) rather than the
-true native grid — the true grid for a 1° tile would be ~111000×111000px,
-impractical to request this way — so what comes back is ~3m/px, not literally
-1m/px despite pulling from USGS's 3DEP "1m" product. That's a deliberate
-tradeoff already built into this codebase, not a confirmed hard limit of the
-WCS server.
+true ~111000×111000px native grid, which isn't practical to request this way
+— so what comes back is ~3m/px, not literally 1m/px, despite pulling from
+USGS's 3DEP "1m" product. Deliberate tradeoff, not a WCS server limit.
 
 `--resolution 1m` goes further: genuine ~1m/px, streamed straight to disk one
-small piece at a time instead of assembled in memory (the naive approach
-would need ~50GB of RAM for one tile). Before fetching, it probes a coarse
-grid over the tile and skips any region that clearly has no coverage, so a
-tile with limited real coverage doesn't pay for thousands of pointless
-requests. It's a separate, more expensive tier from `--try-3m` — request it
-explicitly; it's never triggered by `--try-3m` or the default `best` cascade,
-and it never uses the ~3m tier as an intermediate step either. A tile with no
-1m coverage at all falls back to the normal 10m/GLO-30 cascade instead of
-being left out of the area mosaic — the point of `--resolution 1m` over a
-whole study area is real detail where it exists, not an all-or-nothing
-demand that leaves holes everywhere else.
+piece at a time instead of assembled in memory (the naive approach needs
+~50GB of RAM for one tile). A coarse coverage probe runs first so a
+mostly-uncovered tile doesn't pay for thousands of pointless requests. It's a
+separate, more expensive tier — never triggered by `--try-3m` or the default
+`best` cascade, and never uses `--try-3m` as an intermediate step. A tile
+with no 1m coverage falls back to the normal 10m/GLO-30 cascade rather than
+leaving a hole in the area mosaic.
 
 Whichever tier finds real coverage, `dem_download.py` writes one extra file
 next to the usual mosaic: `<name>_mosaic_hires.vrt`. Open it exactly like a
@@ -151,6 +146,37 @@ in the same folder.
 
 Not wired up yet: `tile_builder.py`'s `--source` doesn't expose either
 high-resolution tier, and `build_dem_mosaic.py` doesn't have `--try-3m` either.
+
+## Direct & cascade AOI fetch
+
+For an area much smaller than a full 1° tile — a few acres up to a couple km
+across — `--direct` and `--cascade` skip the whole-tile pipeline entirely and
+fetch exactly the requested `--bounds`, in as few requests as each source's
+own per-request limit allows (often just one):
+
+```bash
+# Exactly this bbox at genuine ~1m/px -- one clipped GeoTIFF, no mosaic,
+# no manifest, no tile cache.
+python python/dem_download.py --bounds "44.50000,-110.20000,44.50128,-110.19873" \
+    --resolution 1m --direct
+
+# Same AOI, but also crops the 10m 3DEP and 30m GLO-30 base tiers for the
+# same bounds (windowed range-reads against the live S3 sources -- no
+# full-tile download) and composites all three into one VRT: real detail
+# where 3DEP has it, falling back through 10m/30m elsewhere -- the same
+# priority the whole-tile pipeline uses, scoped to just the requested area.
+python python/dem_download.py --bounds "44.50000,-110.20000,44.50128,-110.19873" \
+    --resolution 1m --cascade
+```
+
+Both require `--bounds` and `--resolution 1m`/`3m` (the top tier to try).
+`--cascade` writes `cascade_manifest.json` plus whichever of
+`native_<res>.tif`/`base_10m.tif`/`base_30m.tif` actually returned data —
+render it with `visualize_cascade_aoi.py` for a per-pixel resolution map.
+
+Known limitation: the 10m/30m crops pick a single source tile from the AOI's
+center point, so an AOI straddling a whole-degree line (rare, but it can
+coincide with an international border) may miss data just past that seam.
 
 ## Visualizing hi-res coverage
 
@@ -165,15 +191,12 @@ if no hi-res tier was ever requested for this area), a per-tile map of which
 source each tile actually used (GLO-30/3DEP 10m/`--try-3m`/`--resolution 1m`),
 and a table of per-tile stats.
 
-A tile's resolution tier is a whole-tile choice — there's no *different*,
-lower tier recorded for the parts of a `--try-3m`/`--resolution 1m` tile its
-own fetch didn't reach (the ~3m tier gap-fills those internally from GLO-30
-without changing its resolution label; genuine ~1m can leave them as real
-nodata). So the map answers "which tier did this area use", and the table's
-`coverage_pct` column answers the different question "how much of that tier's
-own tile is actually real dense native data" — reading the map alone would
-overstate how much real high-resolution detail a mostly-uncovered
-`--resolution 1m` tile actually has.
+A tile's resolution tier is a whole-tile choice, so the map can't show
+sub-tile variation — `coverage_pct` in the table is how much of that tile's
+own area is real dense native data rather than filled/absent, which is the
+number that actually tells you how much fine detail a mostly-uncovered tile
+has. For an AOI small enough to check every pixel directly instead, see
+`visualize_cascade_aoi.py` above.
 
 ## Visualizing a tile
 

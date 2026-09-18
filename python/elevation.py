@@ -828,7 +828,16 @@ def fetch_dem_direct(
                     resampling=Resampling.nearest,
                 )
         dst.write(arr, 1, window=window)
-        return data is not None and bool((arr > nodata + 1).any())
+        # Exact 0.0 is this WCS server's own out-of-coverage fill value
+        # (confirmed live: querying open ocean/well outside the US
+        # returns a well-formed all-zero GeoTIFF, not a proper nodata
+        # tag) -- same convention dem_download.py's own coverage probe
+        # already applies (`arr != 0` alongside the nodata check) and
+        # repair_dem_gaps.py's gap detection relies on ("no legitimate
+        # near-zero-elevation terrain" in this pipeline's areas).
+        # Without this, every out-of-coverage request here looked like
+        # a coverage hit.
+        return data is not None and bool(((arr > nodata + 1) & (arr != 0)).any())
 
     profile = {
         'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
@@ -888,6 +897,75 @@ def fetch_dem_direct(
     print(f"[3DEP-direct] Done: {n_fetched} fetched, {n_failed} failed -- "
           f"{out_path.name} ({out_path.stat().st_size/1e6:.2f}MB)")
     return out_path, n_fetched, n_failed
+
+
+def fetch_vsicurl_crop(
+    url: str, south: float, west: float, north: float, east: float,
+    resolution_m: float, out_path: Path,
+) -> "Path | None":
+    """
+    Crop [south, west, north, east] directly out of a remote GeoTIFF
+    (any public HTTPS URL -- the 3DEP 10m and GLO-30 sources are both
+    plain S3 objects) via GDAL's /vsicurl/ virtual filesystem, writing
+    just that crop to out_path. No full-tile download: GDAL's warp
+    reader only range-requests the source blocks overlapping the
+    destination window, the same way reproject() already streams
+    everywhere else in this pipeline (confirmed live: a quarter-mile
+    crop out of a 10800x10800 3DEP tile or a 3600x3600 GLO-30 tile
+    each cost a handful of small range requests, not the whole file).
+
+    Reprojects onto a plain EPSG:4326 grid at resolution_m so the
+    result is in the same CRS/pixel convention build_hires_vrt.py
+    requires of every layer it composites (the 3DEP 10m source is
+    natively EPSG:4269/NAD83, not EPSG:4326, so this step is required,
+    not just tidy).
+
+    Returns None if the crop came back entirely nodata (area outside
+    that source's coverage) instead of writing an empty file.
+    """
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject
+    from rasterio.enums import Resampling
+
+    width_px  = max(1, round((east - west) * _METERS_PER_DEGREE_LAT
+                              / resolution_m))
+    height_px = max(1, round((north - south) * _METERS_PER_DEGREE_LAT
+                              / resolution_m))
+    dst_transform = from_bounds(west, south, east, north, width_px, height_px)
+    nodata = -9999.0
+
+    with rasterio.open(f"/vsicurl/{url}") as src:
+        src_nodata = src.nodata if src.nodata is not None else nodata
+        arr = np.full((height_px, width_px), nodata, dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1), destination=arr,
+            src_transform=src.transform, src_crs=src.crs,
+            dst_transform=dst_transform, dst_crs='EPSG:4326',
+            src_nodata=src_nodata, dst_nodata=nodata,
+            resampling=Resampling.bilinear,
+        )
+
+    # Exact 0.0 is GLO-30's and 3DEP 10m's own sea-level/no-land
+    # convention (confirmed live: an all-ocean crop comes back as a
+    # well-formed all-zero raster, not nodata) -- same convention
+    # fetch_dem_direct() above already had to apply for the WCS
+    # source, and the one repair_dem_gaps.py's gap detection relies on
+    # elsewhere in this pipeline. Without it, an all-ocean crop looked
+    # like a successful fetch instead of "no real data here."
+    if not ((arr > nodata + 1) & (arr != 0)).any():
+        return None
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = {
+        'driver': 'GTiff', 'dtype': 'float32', 'count': 1,
+        'width': width_px, 'height': height_px, 'crs': 'EPSG:4326',
+        'transform': dst_transform, 'nodata': nodata,
+        'compress': 'deflate', 'predictor': 2,
+    }
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(arr, 1)
+    return out_path
 
 
 def download_tile_3dep(lat: float, lng: float, resolution: int = 10) -> Path:

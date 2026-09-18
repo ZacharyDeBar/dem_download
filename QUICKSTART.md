@@ -42,8 +42,8 @@ To fetch the highest resolution available (genuine ~1m/px where USGS 3DEP has it
 ```bash
 .venv/bin/python python/dem_download.py N44W113 N47W109 --resolution 1m
 ```
-
 There's also a cheaper `--try-3m` tier (~3m/px, ~900 requests/tile, a few minutes) if 1m's cost isn't worth it for your area — see [High-resolution output](README.md#high-resolution-output) in the full README for the tradeoffs between the two.
+
 
 ## Prefer R?
 
